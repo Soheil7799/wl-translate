@@ -42,6 +42,39 @@ enum Event {
 /// How long to wait after the last keystroke before re-translating.
 const SETTLE: Duration = Duration::from_millis(350);
 
+/// How many past translations to keep. Small on purpose: this is for stepping
+/// back a few, not for archiving.
+const HISTORY: usize = 30;
+
+/// Languages the picker offers, beyond whichever ones are already on the chip
+/// row. Not exhaustive - the engines accept far more - but it covers what a
+/// person actually reaches for, and the chips remember anything you use.
+const LANGUAGES: &[(&str, &str)] = &[
+    ("auto", "Detect automatically"),
+    ("ar", "Arabic"),
+    ("zh", "Chinese"),
+    ("nl", "Dutch"),
+    ("en", "English"),
+    ("fr", "French"),
+    ("de", "German"),
+    ("el", "Greek"),
+    ("he", "Hebrew"),
+    ("hi", "Hindi"),
+    ("it", "Italian"),
+    ("ja", "Japanese"),
+    ("ko", "Korean"),
+    ("ku", "Kurdish"),
+    ("fa", "Persian"),
+    ("pl", "Polish"),
+    ("pt", "Portuguese"),
+    ("ru", "Russian"),
+    ("es", "Spanish"),
+    ("sv", "Swedish"),
+    ("tr", "Turkish"),
+    ("uk", "Ukrainian"),
+    ("ur", "Urdu"),
+];
+
 /// Widgets the update path needs to reach back into.
 struct Window {
     window: gtk::ApplicationWindow,
@@ -59,6 +92,9 @@ struct Window {
     /// tell our writes from the user's - without this, showing a translation
     /// would look like an edit and translate itself again, forever.
     quiet: Cell<bool>,
+    /// Past translations, newest first.
+    history: RefCell<Vec<Outcome>>,
+    history_button: gtk::MenuButton,
 }
 
 /// Run the daemon. Blocks until the process is interrupted.
@@ -208,7 +244,10 @@ fn spawn_dbus(
     triggers: async_channel::Sender<Verb>,
     events: async_channel::Sender<Event>,
 ) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    // Single-threaded on purpose. This runtime does nothing but answer D-Bus
+    // calls and forward them; a multi-threaded one spawned a worker per core
+    // and their stacks showed up as two dozen threads for no benefit at all.
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("could not start the D-Bus runtime")?;
@@ -274,10 +313,34 @@ fn build_window(app: &gtk::Application, jobs: std::sync::mpsc::Sender<Job>) -> W
     swap.add_css_class("flat");
     swap.add_css_class("circular");
 
+    let source_more = gtk::MenuButton::new();
+    source_more.set_icon_name("view-more-symbolic");
+    source_more.set_tooltip_text(Some("All languages"));
+    source_more.add_css_class("flat");
+
+    let target_more = gtk::MenuButton::new();
+    target_more.set_icon_name("view-more-symbolic");
+    target_more.set_tooltip_text(Some("All languages"));
+    target_more.add_css_class("flat");
+
+    let history_button = gtk::MenuButton::new();
+    history_button.set_icon_name("document-open-recent-symbolic");
+    history_button.set_tooltip_text(Some("Recent translations"));
+    history_button.add_css_class("flat");
+
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     header.append(&source_chips);
+    header.append(&source_more);
     header.append(&swap);
+    header.append(&target_more);
     header.append(&target_chips);
+    header.append(&history_button);
+
+    // Parked on the header so `wire` can find them once the Window exists.
+    unsafe {
+        header.set_data("source_more", source_more);
+        header.set_data("target_more", target_more);
+    }
 
     let status = gtk::Label::builder().xalign(0.0).hexpand(true).build();
     status.add_css_class("dim-label");
@@ -359,6 +422,160 @@ fn build_window(app: &gtk::Application, jobs: std::sync::mpsc::Sender<Job>) -> W
         jobs,
         generation: Cell::new(0),
         quiet: Cell::new(false),
+        history: RefCell::new(Vec::new()),
+        history_button,
+    }
+}
+
+/// A popover listing every language, so one you have not used recently is still
+/// reachable. The chips only ever show recent choices, which left anything else
+/// requiring a hand-edit of the config file.
+fn language_picker(window: &Rc<Window>, is_source: bool) -> gtk::Popover {
+    let search = gtk::SearchEntry::new();
+    search.set_placeholder_text(Some("Search languages"));
+
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+
+    for (code, name) in LANGUAGES {
+        let row = gtk::ListBoxRow::new();
+        let label = gtk::Label::builder()
+            .label(format!("{name}   ({code})"))
+            .xalign(0.0)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(10)
+            .margin_end(10)
+            .build();
+
+        row.set_child(Some(&label));
+        // Kept for the filter, so searching matches the name as well as the code.
+        unsafe { row.set_data("search", format!("{name} {code}").to_lowercase()) };
+        list.append(&row);
+    }
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&list)
+        .min_content_height(320)
+        .min_content_width(240)
+        .build();
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    content.append(&search);
+    content.append(&scroller);
+
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(&content));
+
+    {
+        let list = list.clone();
+        search.connect_search_changed(move |entry| {
+            let needle = entry.text().to_lowercase();
+            let mut row = list.first_child();
+
+            while let Some(child) = row {
+                if let Ok(row) = child.clone().downcast::<gtk::ListBoxRow>() {
+                    let haystack = unsafe { row.data::<String>("search") };
+                    let shown = match haystack {
+                        Some(text) => unsafe { text.as_ref() }.contains(&needle),
+                        None => true,
+                    };
+                    row.set_visible(shown);
+                }
+                row = child.next_sibling();
+            }
+        });
+    }
+
+    {
+        let window = window.clone();
+        let popover = popover.clone();
+
+        list.connect_row_activated(move |_list, row| {
+            let index = row.index();
+
+            if let Some((code, _)) = LANGUAGES.get(index as usize) {
+                window.pick_language(code, is_source);
+                rebuild_chips(&window);
+            }
+
+            popover.popdown();
+        });
+    }
+
+    list.set_activate_on_single_click(true);
+    popover
+}
+
+/// A popover of past translations. Choosing one puts it back in the panes.
+fn history_popover(window: &Rc<Window>) -> gtk::Popover {
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.set_activate_on_single_click(true);
+
+    for entry in window.history.borrow().iter() {
+        let row = gtk::ListBoxRow::new();
+
+        let summary = gtk::Label::builder()
+            .label(summarise(&entry.source))
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(10)
+            .margin_end(10)
+            .build();
+
+        row.set_child(Some(&summary));
+        list.append(&row);
+    }
+
+    if window.history.borrow().is_empty() {
+        let empty = gtk::Label::builder()
+            .label("Nothing translated yet")
+            .margin_top(12)
+            .margin_bottom(12)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        empty.add_css_class("dim-label");
+        list.append(&empty);
+    }
+
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(
+        &gtk::ScrolledWindow::builder()
+            .child(&list)
+            .min_content_height(260)
+            .min_content_width(320)
+            .build(),
+    ));
+
+    {
+        let window = window.clone();
+        let popover = popover.clone();
+
+        list.connect_row_activated(move |_list, row| {
+            let entry = window.history.borrow().get(row.index() as usize).cloned();
+
+            if let Some(entry) = entry {
+                window.show_outcome(&entry);
+            }
+
+            popover.popdown();
+        });
+    }
+
+    popover
+}
+
+/// One line of a translation, for a history row.
+fn summarise(text: &str) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    match line.char_indices().nth(60) {
+        Some((byte, _)) => format!("{}...", &line[..byte].trim_end()),
+        None => line,
     }
 }
 
@@ -396,6 +613,29 @@ fn wire(window: &Rc<Window>) {
             }
         });
     });
+
+    if let Some(header) = window.source_chips.parent() {
+        for (key, is_source) in [("source_more", true), ("target_more", false)] {
+            if let Some(button) = unsafe { header.data::<gtk::MenuButton>(key) } {
+                let button = unsafe { button.as_ref() };
+                button.set_popover(Some(&language_picker(window, is_source)));
+            }
+        }
+    }
+
+    {
+        // Rebuilt on each open so it reflects what has happened since.
+        let weak = Rc::downgrade(window);
+
+        // set_create_popup_func runs just before the popover is shown, which is
+        // exactly when the list should be built - the history has usually grown
+        // since the last time it was opened.
+        window.history_button.set_create_popup_func(move |button| {
+            if let Some(window) = weak.upgrade() {
+                button.set_popover(Some(&history_popover(&window)));
+            }
+        });
+    }
 
     let weak = Rc::downgrade(window);
 
@@ -504,7 +744,21 @@ impl Window {
         self.window.present();
     }
 
+    fn remember(&self, outcome: &Outcome) {
+        if outcome.source.trim().is_empty() {
+            return;
+        }
+
+        let mut history = self.history.borrow_mut();
+
+        // Re-translating the same text should move it up, not stack duplicates.
+        history.retain(|past| past.source != outcome.source);
+        history.insert(0, outcome.clone());
+        history.truncate(HISTORY);
+    }
+
     fn show_outcome(&self, outcome: &Outcome) {
+        self.remember(outcome);
         self.quiet.set(true);
         self.source.buffer().set_text(&outcome.source);
         self.target.buffer().set_text(&outcome.translation);

@@ -36,6 +36,7 @@ async-channel = "2.5.0"
 # renderer for both is the point: two of them drift, and the preview stops
 # matching the file in ways nobody notices until it matters.
 cairo-rs = { version = "0.22", features = ["png"] }
+libc = "0.2.189"
 
 [profile.release]
 opt-level = 3

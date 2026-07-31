@@ -2129,6 +2129,7 @@ dependencies = [
  "gtk4",
  "image",
  "leptess",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

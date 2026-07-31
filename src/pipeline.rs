@@ -170,7 +170,20 @@ impl Worker {
     /// reload - a few hundred milliseconds on the next capture - and gives back
     /// the memory for the hours in between.
     pub fn rest(&mut self) {
-        self.ocr = None;
+        if self.ocr.take().is_none() {
+            return;
+        }
+
+        // Dropping the engine returns its memory to the ALLOCATOR, not to the
+        // kernel: glibc keeps freed heap in its arenas for reuse, so RSS stays
+        // where it was and the unload looks like it did nothing. malloc_trim is
+        // what actually hands the pages back.
+        //
+        // Safe: it takes no pointers and only releases memory the allocator
+        // already considers free.
+        unsafe {
+            libc::malloc_trim(0);
+        }
     }
 
     fn engine(&mut self) -> Result<&mut ocr::Ocr> {
