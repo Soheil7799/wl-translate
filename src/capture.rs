@@ -15,6 +15,31 @@ impl Region {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Accept a region given on the command line instead of dragged, in the
+    /// same `X,Y WxH` form slurp emits. Lets the OCR path be scripted, tested,
+    /// and re-run against a fixed area (subtitles, a lecture slide).
+    pub fn parse(spec: &str) -> Result<Self> {
+        let spec = spec.trim();
+        let (origin, size) = spec
+            .split_once(' ')
+            .with_context(|| format!("expected geometry as 'X,Y WxH', got '{spec}'"))?;
+
+        let (x, y) = origin
+            .split_once(',')
+            .with_context(|| format!("expected origin as 'X,Y', got '{origin}'"))?;
+        let (w, h) = size
+            .split_once('x')
+            .with_context(|| format!("expected size as 'WxH', got '{size}'"))?;
+
+        for (label, value) in [("x", x), ("y", y), ("width", w), ("height", h)] {
+            value
+                .parse::<i32>()
+                .with_context(|| format!("{label} is not a number in '{spec}'"))?;
+        }
+
+        Ok(Region(spec.to_string()))
+    }
 }
 
 /// Ask the user to drag a region. `Ok(None)` means they cancelled (Esc).

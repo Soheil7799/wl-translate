@@ -47,6 +47,10 @@ enum Command {
         /// Extract the text but skip translation
         #[arg(long)]
         raw: bool,
+
+        /// Use this region instead of dragging one, as "X,Y WxH"
+        #[arg(long)]
+        geometry: Option<String>,
     },
 
     /// Translate the current mouse selection
@@ -66,9 +70,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let (source, translated) = match &cli.command {
-        Command::Ocr { langs, raw } => {
-            let Some(region) = capture::select_region()? else {
-                return Ok(()); // user cancelled the drag; not an error
+        Command::Ocr {
+            langs,
+            raw,
+            geometry,
+        } => {
+            let region = match geometry {
+                Some(spec) => capture::Region::parse(spec)?,
+                None => match capture::select_region()? {
+                    Some(region) => region,
+                    None => return Ok(()), // user cancelled the drag; not an error
+                },
             };
 
             let image = capture::grab(&region)?;
