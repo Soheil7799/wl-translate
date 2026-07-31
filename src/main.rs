@@ -78,7 +78,12 @@ enum Command {
 
     /// Translate text given as arguments
     Text {
-        #[arg(required = true, trailing_var_arg = true)]
+        // Deliberately NOT `trailing_var_arg`: that captures everything after
+        // the first word, so `text "ciao" --to fa` silently translated the
+        // string "ciao --to fa" instead of honouring the flag. `num_args`
+        // still allows unquoted multi-word text while flags keep parsing
+        // wherever they appear.
+        #[arg(required = true, num_args = 1..)]
         words: Vec<String>,
     },
 
