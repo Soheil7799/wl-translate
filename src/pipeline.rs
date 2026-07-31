@@ -16,9 +16,20 @@ pub enum Verb {
         /// Skip the interactive drag and use this region.
         geometry: Option<String>,
     },
+    /// OCR a region but do not translate it.
+    OcrRaw,
     Selection,
     Clipboard,
     Text(String),
+    /// Raise the window without changing its contents. Handled by the UI, never
+    /// reaches the worker.
+    Show,
+}
+
+impl Verb {
+    pub fn is_raw(&self) -> bool {
+        matches!(self, Verb::OcrRaw)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -27,8 +38,6 @@ pub struct Job {
     pub from: String,
     pub to: String,
     pub engine: String,
-    /// Extract text but skip translation.
-    pub raw: bool,
 }
 
 impl Job {
@@ -38,7 +47,6 @@ impl Job {
             from: "auto".into(),
             to: "en".into(),
             engine: "google".into(),
-            raw: false,
         }
     }
 }
@@ -47,6 +55,7 @@ impl Job {
 pub struct Outcome {
     pub source: String,
     pub translation: String,
+    /// What the engine decided the source language was.
     pub from: String,
     pub to: String,
 }
@@ -67,7 +76,8 @@ impl Worker {
         }
     }
 
-    /// Run one job. `Ok(None)` means the user cancelled the region drag.
+    /// Run one job. `Ok(None)` means there was nothing to do - the user
+    /// cancelled the region drag, or the verb was not ours to handle.
     pub fn run(&mut self, job: &Job) -> Result<Option<Outcome>> {
         let Some(source) = self.read_source(job)? else {
             return Ok(None);
@@ -75,7 +85,7 @@ impl Worker {
 
         anyhow::ensure!(!source.is_empty(), "no text found");
 
-        if job.raw {
+        if job.verb.is_raw() {
             return Ok(Some(Outcome {
                 translation: source.clone(),
                 source,
@@ -96,22 +106,26 @@ impl Worker {
 
     fn read_source(&mut self, job: &Job) -> Result<Option<String>> {
         Ok(match &job.verb {
+            Verb::Show => None,
             Verb::Text(text) => Some(text.clone()),
             Verb::Selection => Some(crate::clip::primary()?),
             Verb::Clipboard => Some(crate::clip::clipboard()?),
-            Verb::Ocr { geometry } => {
-                let region = match geometry {
-                    Some(spec) => capture::Region::parse(spec)?,
-                    None => match capture::select_region()? {
-                        Some(region) => region,
-                        None => return Ok(None),
-                    },
-                };
-
-                let image = capture::grab(&region)?;
-                Some(self.engine()?.recognize(&image)?)
-            }
+            Verb::OcrRaw => self.capture_text(None)?,
+            Verb::Ocr { geometry } => self.capture_text(geometry.as_deref())?,
         })
+    }
+
+    fn capture_text(&mut self, geometry: Option<&str>) -> Result<Option<String>> {
+        let region = match geometry {
+            Some(spec) => capture::Region::parse(spec)?,
+            None => match capture::select_region()? {
+                Some(region) => region,
+                None => return Ok(None),
+            },
+        };
+
+        let image = capture::grab(&region)?;
+        Ok(Some(self.engine()?.recognize(&image)?))
     }
 
     fn engine(&mut self) -> Result<&mut ocr::Ocr> {

@@ -37,22 +37,28 @@ install -Dm755 target/release/wl-translate ~/.local/bin/wl-translate
 
 ## Usage
 
-```sh
-wl-translate ocr --to en            # drag a region, OCR it, translate
-wl-translate ocr --raw              # drag a region, just extract the text
-wl-translate selection --to fa      # translate the current mouse selection
-wl-translate clipboard --to it      # translate the clipboard
-wl-translate text --to en "ciao"    # translate an argument
+Verbs carry no languages. Which languages you work in is a setting you change in
+the window and it is remembered — a keybind should say *what to do*, not restate
+what you are translating into.
 
-# useful flags
---from it      # skip language detection
---copy         # also put the result on the clipboard
---notify       # show the result as a desktop notification
---engine ai    # use an LLM instead of Google
---geometry "X,Y WxH"   # OCR a fixed region instead of dragging one
+```sh
+wl-translate selection     # translate the current mouse selection
+wl-translate clipboard     # translate the clipboard
+wl-translate ocr           # drag a region, OCR it, translate
+wl-translate ocr --raw     # drag a region, just extract the text
+wl-translate text "ciao"   # translate an argument
+wl-translate show          # raise the window as it is
 ```
 
-Bound to a key there is no terminal to print to, so use `--notify --copy`.
+Flags exist for scripting and are never needed day to day:
+
+```sh
+--to fa --from it      # override the saved languages for one run
+--engine ai            # use an LLM instead of Google
+--geometry "X,Y WxH"   # OCR a fixed region instead of dragging one
+--copy --notify        # clipboard and notification, for running without a daemon
+--no-daemon            # do the work here even if a daemon is running
+```
 
 ## Daemon
 
@@ -60,26 +66,56 @@ Bound to a key there is no terminal to print to, so use `--notify --copy`.
 wl-translate daemon
 ```
 
-Runs resident with the tesseract language models loaded, and shows results in a
-window instead of a notification. Every verb automatically hands its work to the
-daemon when one is running, so the same keybinds get faster and gain a UI with
-nothing to change. `--no-daemon` forces the work into the calling process.
+Runs resident with the tesseract language models loaded and shows results in a
+window. Every verb hands its work to the daemon when one is running, so the same
+keybinds get faster and gain a UI with nothing to change.
 
-It also exposes the verbs on D-Bus, so a compositor can trigger it without this
+It exposes the verbs on D-Bus, so a compositor can trigger it without this
 program's CLI in the loop at all:
 
 ```sh
 busctl --user call org.wl_translate.Daemon /org/wl_translate/Daemon \
-       org.wl_translate.Daemon1 Selection s en
+       org.wl_translate.Daemon1 Selection
 ```
 
 That call returns in ~8ms — a keybind never waits for OCR.
 
-Methods: `Ocr(s to)`, `OcrRaw(s to)`, `Selection(s to)`, `Clipboard(s to)`,
-`Text(s text, s to)`.
+Methods, none of which take a language: `Ocr()`, `OcrRaw()`, `Selection()`,
+`Clipboard()`, `Text(s text)`, `Show()`.
 
-The popup right-aligns right-to-left text and left-aligns everything else, per
-side, using the detected source language and the target language.
+### The window
+
+Modelled on Crow Translate: a row of language chips per side with `auto` first
+and the rest ordered most-recently-used, a swap button between them, and two
+editable panes.
+
+- Clicking a chip re-translates the current text immediately.
+- Editing the source re-translates after a 350ms pause.
+- The translation pane is editable too, so you can adjust wording before
+  copying; editing it triggers nothing.
+- `auto` on the source side means "detect it". On the target side there is
+  nothing to detect, so it means your system language, taken from the locale.
+- Right-to-left text aligns right and left-to-right aligns left, handled by
+  cosmic-text without any special casing.
+
+## Settings
+
+`~/.config/wl-translate/config.json`, written by the window whenever you change
+a language:
+
+```json
+{
+  "source": "auto",
+  "target": "fa",
+  "recent_source": ["it", "en", "fa"],
+  "recent_target": ["fa", "en", "it"],
+  "engine": "google",
+  "langs": "eng+ita+fas"
+}
+```
+
+A missing or unparseable file just means defaults — settings should never be the
+reason a keybind stops working.
 
 ### Window rule
 
@@ -98,10 +134,10 @@ Without this the compositor tiles it like an ordinary window.
 Hyprland:
 
 ```
-bind = SUPER CTRL, T,     exec, wl-translate selection --to en --copy --notify
-bind = SUPER ALT, T,      exec, wl-translate clipboard --to en --copy --notify
-bind = SUPER, Print,      exec, wl-translate ocr --to en --copy --notify
-bind = SUPER SHIFT, Print, exec, wl-translate ocr --raw --copy --notify
+bind = SUPER CTRL, T,     exec, wl-translate selection
+bind = SUPER ALT, T,      exec, wl-translate clipboard
+bind = SUPER, Print,      exec, wl-translate ocr
+bind = SUPER SHIFT, Print, exec, wl-translate ocr --raw
 ```
 
 KDE, niri, sway and anything else: bind the same commands. That is the whole
@@ -160,11 +196,13 @@ and the popup.
 
 Known gaps:
 
-- The popup sets no Wayland `app_id`, so window rules have to match on title.
-- Source text is not editable yet, so OCR mistakes cannot be corrected in place.
-- No language picker in the window; the target language comes from the caller.
-- The D-Bus methods carry only a target language. Anything using `--from`,
-  `--engine` or `--geometry` runs in the calling process instead of the daemon.
+- The window sets `id` but the Wayland `app_id` still comes through empty, so
+  compositor rules have to match on title.
+- No full language list — only the chips, so reaching a language you have not
+  used recently means editing the config file.
+- Overriding `--from`, `--to`, `--engine` or `--geometry` runs in the calling
+  process rather than the daemon, since the D-Bus verbs carry no arguments.
+- The `ai` backend is written but untested.
 
 ## License
 
