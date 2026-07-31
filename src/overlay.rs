@@ -563,7 +563,7 @@ fn tool_column(state: &Rc<RefCell<State>>, canvas: &gtk::DrawingArea) -> gtk::Wi
     let tools = gtk::Box::new(gtk::Orientation::Vertical, 4);
 
     for (tool, icon, tip) in [
-        (None, "object-select-symbolic", "Select and move  (v)"),
+        (None, "find-location-symbolic", "Select and move  (v)"),
         (Some(Tool::Pen), "document-edit-symbolic", Tool::Pen.label()),
         (Some(Tool::Arrow), "go-next-symbolic", Tool::Arrow.label()),
         (
@@ -585,6 +585,7 @@ fn tool_column(state: &Rc<RefCell<State>>, canvas: &gtk::DrawingArea) -> gtk::Wi
     ] {
         let button = gtk::Button::from_icon_name(icon);
         button.set_tooltip_text(Some(tip));
+        button.add_css_class("flat");
 
         {
             let state = state.clone();
@@ -599,6 +600,7 @@ fn tool_column(state: &Rc<RefCell<State>>, canvas: &gtk::DrawingArea) -> gtk::Wi
     refresh_tools(state);
 
     let undo = gtk::Button::from_icon_name("edit-undo-symbolic");
+    undo.add_css_class("flat");
     undo.set_tooltip_text(Some("Undo  (Ctrl+Z)"));
     {
         let state = state.clone();
@@ -614,6 +616,7 @@ fn tool_column(state: &Rc<RefCell<State>>, canvas: &gtk::DrawingArea) -> gtk::Wi
     tools.append(&undo);
 
     let redo = gtk::Button::from_icon_name("edit-redo-symbolic");
+    redo.add_css_class("flat");
     redo.set_tooltip_text(Some("Redo  (Ctrl+Shift+Z)"));
     {
         let state = state.clone();
@@ -636,6 +639,8 @@ fn tool_column(state: &Rc<RefCell<State>>, canvas: &gtk::DrawingArea) -> gtk::Wi
         let swatch = gtk::Button::new();
         swatch.set_tooltip_text(Some(&format!("{name}  ({})", index + 1)));
         swatch.set_size_request(28, 28);
+        swatch.add_css_class("flat");
+        swatch.add_css_class("circular");
 
         let dot = gtk::DrawingArea::new();
         dot.set_size_request(16, 16);
@@ -679,13 +684,23 @@ fn tool_column(state: &Rc<RefCell<State>>, canvas: &gtk::DrawingArea) -> gtk::Wi
         colors.append(&swatch);
     }
 
-    let strip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    tools.set_valign(gtk::Align::Center);
+    colors.set_valign(gtk::Align::Center);
+
+    let strip = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     strip.append(&tools);
     strip.append(&colors);
     strip.set_halign(gtk::Align::Start);
     strip.set_valign(gtk::Align::Center);
     strip.set_margin_start(16);
+
+    // `osd` and `toolbar` are GTK's own style classes, so the strip picks up
+    // whatever the system theme says an overlay toolbar looks like - including
+    // light/dark - instead of carrying colours of its own.
     strip.add_css_class("osd");
+    strip.add_css_class("toolbar");
+    strip.set_margin_top(8);
+    strip.set_margin_bottom(8);
 
     strip.upcast()
 }
@@ -721,6 +736,7 @@ fn action_bar(
     ] {
         let button = gtk::Button::from_icon_name(icon);
         button.set_tooltip_text(Some(tip));
+        button.add_css_class("flat");
 
         let state = state.clone();
         let window = window.clone();
@@ -743,6 +759,7 @@ fn action_bar(
     bar.set_valign(gtk::Align::End);
     bar.set_margin_bottom(24);
     bar.add_css_class("osd");
+    bar.add_css_class("toolbar");
 
     bar.upcast()
 }

@@ -241,6 +241,7 @@ fn build_window(app: &gtk::Application, jobs: std::sync::mpsc::Sender<Job>) -> W
     let swap = gtk::Button::from_icon_name("object-flip-horizontal-symbolic");
     swap.set_tooltip_text(Some("Swap languages"));
     swap.add_css_class("flat");
+    swap.add_css_class("circular");
 
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     header.append(&source_chips);
@@ -256,8 +257,14 @@ fn build_window(app: &gtk::Application, jobs: std::sync::mpsc::Sender<Job>) -> W
     panes.append(&scrolled(&source));
     panes.append(&scrolled(&target));
 
-    let copy = gtk::Button::with_label("Copy");
-    let close = gtk::Button::with_label("Close");
+    // Icons and GTK's own style classes throughout, so the window looks like
+    // whatever the system theme says a GTK window looks like. Nothing here sets
+    // a colour or a font of its own.
+    let copy = gtk::Button::from_icon_name("edit-copy-symbolic");
+    copy.set_tooltip_text(Some("Copy the translation"));
+
+    let close = gtk::Button::from_icon_name("window-close-symbolic");
+    close.set_tooltip_text(Some("Close"));
 
     let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     footer.append(&copy);
