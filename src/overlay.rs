@@ -174,11 +174,19 @@ where
             return mouse::Interaction::default();
         };
 
-        match self.selection.map(|selection| selection.0) {
-            Some(rect) if nearest_corner(rect, position).is_some() => mouse::Interaction::Grab,
-            Some(rect) if rect.contains(position) => mouse::Interaction::Move,
-            _ => mouse::Interaction::Crosshair,
+        let Some(rect) = self.selection.map(|selection| selection.0) else {
+            return mouse::Interaction::Crosshair;
+        };
+
+        if let Some(corner) = nearest_corner(rect, position) {
+            return resize_cursor(corner);
         }
+
+        if rect.contains(position) {
+            return mouse::Interaction::Move;
+        }
+
+        mouse::Interaction::Crosshair
     }
 }
 
@@ -259,6 +267,19 @@ fn nearest_corner(rect: Rectangle, position: Point) -> Option<Corner> {
                 && (corner.y - position.y).abs() <= HANDLE_GRAB
         })
         .map(|(corner, _)| corner)
+}
+
+/// The cursor for dragging a given corner.
+///
+/// A corner resizes along the diagonal it sits on, so the arrow has to point
+/// that way. Top-left and bottom-right share the ↖↘ axis; top-right and
+/// bottom-left share ↗↙. A grab hand says "you can pick this up and move it",
+/// which is what dragging the middle does, not what dragging a corner does.
+fn resize_cursor(corner: Corner) -> mouse::Interaction {
+    match corner {
+        Corner::TopLeft | Corner::BottomRight => mouse::Interaction::ResizingDiagonallyDown,
+        Corner::TopRight | Corner::BottomLeft => mouse::Interaction::ResizingDiagonallyUp,
+    }
 }
 
 fn opposite(rect: Rectangle, corner: Corner) -> Point {
@@ -440,6 +461,34 @@ mod tests {
         let selection = at(0.0, 40.0, 400.0, 1040.0);
 
         assert_eq!(toolbar_anchor(selection, SCREEN, BAR), Anchor::Top);
+    }
+
+    #[test]
+    fn each_corner_points_along_the_diagonal_it_resizes() {
+        assert_eq!(
+            resize_cursor(Corner::TopLeft),
+            mouse::Interaction::ResizingDiagonallyDown
+        );
+        assert_eq!(
+            resize_cursor(Corner::BottomRight),
+            mouse::Interaction::ResizingDiagonallyDown
+        );
+        assert_eq!(
+            resize_cursor(Corner::TopRight),
+            mouse::Interaction::ResizingDiagonallyUp
+        );
+        assert_eq!(
+            resize_cursor(Corner::BottomLeft),
+            mouse::Interaction::ResizingDiagonallyUp
+        );
+    }
+
+    #[test]
+    fn corners_are_found_within_the_grab_radius_and_not_beyond_it() {
+        let rect = Rectangle::new(Point::new(100.0, 100.0), Size::new(200.0, 200.0));
+
+        assert!(nearest_corner(rect, Point::new(104.0, 104.0)).is_some());
+        assert!(nearest_corner(rect, Point::new(200.0, 200.0)).is_none());
     }
 
     #[test]
