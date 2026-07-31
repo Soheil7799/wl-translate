@@ -18,10 +18,7 @@ leptess = "0.14"
 
 image = { version = "0.25", default-features = false, features = ["png"] }
 
-# Bakes annotations into the saved PNG with a real anti-aliased rasteriser,
-# rather than hand-rolling line and arrow drawing over raw pixels. Cairo draws
-# the same shapes on screen; tiny-skia draws them into the file.
-tiny-skia = { version = "0.11", features = ["png-format"] }
+
 
 # D-Bus. On tokio, served from a thread of its own and handed to the GTK main
 # loop over an async channel.
@@ -35,6 +32,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 gtk = { version = "0.11", package = "gtk4", features = ["v4_12"] }
 glib = "0.21"
 async-channel = "2.5.0"
+# Cairo draws the annotations both on screen and into the saved PNG. One
+# renderer for both is the point: two of them drift, and the preview stops
+# matching the file in ways nobody notices until it matters.
+cairo-rs = { version = "0.22", features = ["png"] }
 
 [profile.release]
 opt-level = 3

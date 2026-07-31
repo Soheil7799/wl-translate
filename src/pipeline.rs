@@ -88,6 +88,7 @@ pub struct Outcome {
 /// Owns the OCR engine across jobs.
 pub struct Worker {
     langs: String,
+    tessdata: Option<String>,
     /// Built on first use and then kept. Loading the language models is the
     /// single most expensive step in the pipeline, so it happens once.
     ocr: Option<ocr::Ocr>,
@@ -97,6 +98,7 @@ impl Worker {
     pub fn new(langs: impl Into<String>) -> Self {
         Self {
             langs: langs.into(),
+            tessdata: crate::settings::Settings::load().tessdata,
             ocr: None,
         }
     }
@@ -161,7 +163,7 @@ impl Worker {
 
     fn engine(&mut self) -> Result<&mut ocr::Ocr> {
         if self.ocr.is_none() {
-            self.ocr = Some(ocr::Ocr::new(&self.langs)?);
+            self.ocr = Some(ocr::Ocr::new(self.tessdata.as_deref(), &self.langs)?);
         }
         Ok(self.ocr.as_mut().expect("just constructed"))
     }

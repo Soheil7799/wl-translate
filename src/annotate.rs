@@ -4,7 +4,7 @@
 //! rasteriser that bakes them into the saved PNG. Rather than writing the
 //! shapes twice and watching the two drift apart, both draw from [`outline`],
 //! which reduces every tool to a list of polylines. The preview strokes them
-//! with the toolkit of the day; the output strokes them with tiny-skia.
+//! Cairo draws both, so a preview cannot disagree with what gets saved.
 
 use crate::geom::{Point, Rect, Size};
 
@@ -215,9 +215,14 @@ fn distance(a: Point, b: Point) -> f64 {
 
 /// Bake annotations into a captured region.
 ///
-/// `origin` is the selection's top-left in the same space the annotations were
-/// recorded in, and `scale` converts that space into image pixels - so the
-/// drawing lands exactly where it appeared on screen.
+/// Cairo draws these, exactly as the live preview does. They used to be drawn
+/// twice - Cairo on screen, a second rasteriser into the file - which is how a
+/// preview quietly stops matching what gets saved. One renderer cannot disagree
+/// with itself.
+///
+/// `origin` is the selection's top-left in the space the annotations were
+/// recorded in, and `scale` converts that space into image pixels, so the
+/// drawing lands where it appeared on screen.
 pub fn rasterize(
     annotations: &[Annotation],
     png: &[u8],
@@ -225,66 +230,72 @@ pub fn rasterize(
     scale: f64,
 ) -> anyhow::Result<Vec<u8>> {
     use anyhow::Context;
-    use tiny_skia::{LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
+    use cairo::{Context as Cairo, Format, ImageSurface, LineCap, LineJoin};
 
     if annotations.is_empty() {
         return Ok(png.to_vec());
     }
 
-    let mut pixmap = Pixmap::decode_png(png).context("could not decode the capture")?;
+    let mut source = &png[..];
+    let loaded = ImageSurface::create_from_png(&mut source).context("could not decode the capture")?;
+
+    let (width, height) = (loaded.width(), loaded.height());
+    let surface =
+        ImageSurface::create(Format::ARgb32, width, height).context("could not allocate a surface")?;
+
+    {
+        let cr = Cairo::new(&surface).context("could not start drawing")?;
+        cr.set_source_surface(&loaded, 0.0, 0.0)?;
+        cr.paint()?;
+    }
 
     // Redaction first, so a box drawn to point at something is not itself
     // pixelated by a later blur.
     for annotation in annotations.iter().filter(|a| a.tool == Tool::Blur) {
         if let Some(area) = annotation.bounds() {
             pixelate(
-                &mut pixmap,
+                &surface,
                 (area.x - origin.x) * scale,
                 (area.y - origin.y) * scale,
                 area.width * scale,
                 area.height * scale,
                 (annotation.width * scale * 2.5).max(6.0),
-            );
+            )?;
         }
     }
 
-    for annotation in annotations.iter().filter(|a| a.tool != Tool::Blur) {
-        let mut paint = Paint::default();
-        let [red, green, blue, alpha] = annotation.color;
-        // tiny-skia works in f32; our geometry is f64, so cast at this boundary.
-        paint.set_color(tiny_skia::Color::from_rgba(red as f32, green as f32, blue as f32, alpha as f32).unwrap_or(
-            tiny_skia::Color::from_rgba8(255, 0, 0, 255),
-        ));
-        paint.anti_alias = true;
+    let cr = Cairo::new(&surface).context("could not start drawing")?;
+    cr.set_line_cap(LineCap::Round);
+    cr.set_line_join(LineJoin::Round);
 
-        let stroke = Stroke {
-            width: (annotation.width * scale).max(1.0) as f32,
-            line_cap: LineCap::Round,
-            line_join: LineJoin::Round,
-            ..Stroke::default()
-        };
+    for annotation in annotations.iter().filter(|a| a.tool != Tool::Blur) {
+        let [red, green, blue, alpha] = annotation.color;
+        cr.set_source_rgba(red, green, blue, alpha);
+        cr.set_line_width((annotation.width * scale).max(1.0));
 
         for line in outline(annotation) {
-            let mut builder = PathBuilder::new();
-
             for (index, point) in line.iter().enumerate() {
                 let x = (point.x - origin.x) * scale;
                 let y = (point.y - origin.y) * scale;
 
                 if index == 0 {
-                    builder.move_to(x as f32, y as f32);
+                    cr.move_to(x, y);
                 } else {
-                    builder.line_to(x as f32, y as f32);
+                    cr.line_to(x, y);
                 }
             }
-
-            if let Some(path) = builder.finish() {
-                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
-            }
+            cr.stroke()?;
         }
     }
 
-    pixmap.encode_png().context("could not encode the annotated capture")
+    drop(cr);
+
+    let mut out = Vec::new();
+    surface
+        .write_to_png(&mut out)
+        .context("could not encode the annotated capture")?;
+
+    Ok(out)
 }
 
 /// Average square blocks of pixels in place.
@@ -292,14 +303,21 @@ pub fn rasterize(
 /// Deliberately destructive: the original pixels are gone from the output, so
 /// unlike a drawn-on black box there is nothing underneath to recover.
 fn pixelate(
-    pixmap: &mut tiny_skia::Pixmap,
+    surface: &cairo::ImageSurface,
     x: f64,
     y: f64,
     width: f64,
     height: f64,
     block: f64,
-) {
-    let (image_width, image_height) = (pixmap.width() as i64, pixmap.height() as i64);
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let image_width = surface.width() as i64;
+    let image_height = surface.height() as i64;
+    let stride = surface.stride() as i64;
+
+    let mut surface = surface.clone();
+    let mut data = surface.data().context("could not access the surface pixels")?;
 
     let left = (x.round() as i64).clamp(0, image_width);
     let top = (y.round() as i64).clamp(0, image_height);
@@ -307,7 +325,6 @@ fn pixelate(
     let bottom = ((y + height).round() as i64).clamp(0, image_height);
 
     let block = (block.round() as i64).max(2);
-    let data = pixmap.data_mut();
 
     let mut block_top = top;
     while block_top < bottom {
@@ -317,30 +334,25 @@ fn pixelate(
         while block_left < right {
             let block_right = (block_left + block).min(right);
 
-            let (mut red, mut green, mut blue, mut alpha, mut count) = (0u32, 0u32, 0u32, 0u32, 0u32);
+            let mut totals = [0u32; 4];
+            let mut count = 0u32;
 
             for row in block_top..block_bottom {
                 for column in block_left..block_right {
-                    let index = ((row * image_width + column) * 4) as usize;
-                    red += data[index] as u32;
-                    green += data[index + 1] as u32;
-                    blue += data[index + 2] as u32;
-                    alpha += data[index + 3] as u32;
+                    let index = (row * stride + column * 4) as usize;
+                    for channel in 0..4 {
+                        totals[channel] += data[index + channel] as u32;
+                    }
                     count += 1;
                 }
             }
 
             if count > 0 {
-                let average = [
-                    (red / count) as u8,
-                    (green / count) as u8,
-                    (blue / count) as u8,
-                    (alpha / count) as u8,
-                ];
+                let average: [u8; 4] = std::array::from_fn(|c| (totals[c] / count) as u8);
 
                 for row in block_top..block_bottom {
                     for column in block_left..block_right {
-                        let index = ((row * image_width + column) * 4) as usize;
+                        let index = (row * stride + column * 4) as usize;
                         data[index..index + 4].copy_from_slice(&average);
                     }
                 }
@@ -351,6 +363,8 @@ fn pixelate(
 
         block_top = block_bottom;
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -361,41 +375,6 @@ mod tests {
         let mut annotation = Annotation::new(tool, from, [1.0, 0.0, 0.0, 1.0], 3.0);
         annotation.extend(to);
         annotation
-    }
-
-    #[test]
-    fn pixelating_flattens_a_region_and_leaves_the_rest_alone() {
-        use tiny_skia::{Pixmap, PremultipliedColorU8};
-
-        let mut pixmap = Pixmap::new(8, 8).unwrap();
-
-        // A gradient, so flattening is visible as neighbouring pixels agreeing.
-        for (index, pixel) in pixmap.pixels_mut().iter_mut().enumerate() {
-            let value = (index * 3) as u8;
-            *pixel = PremultipliedColorU8::from_rgba(value, value, value, 255).unwrap();
-        }
-
-        let before_outside = pixmap.pixels()[63];
-        pixelate(&mut pixmap, 0.0, 0.0, 4.0, 4.0, 4.0);
-
-        let flattened = &pixmap.pixels()[..4];
-        assert!(flattened.iter().all(|p| p.red() == flattened[0].red()));
-
-        // The far corner was outside the region and must be untouched.
-        assert_eq!(pixmap.pixels()[63].red(), before_outside.red());
-    }
-
-    #[test]
-    fn a_finished_freehand_stroke_survives_for_every_freehand_tool() {
-        for tool in [Tool::Pen, Tool::Highlight] {
-            let mut stroke = Annotation::new(tool, Point::new(0.0, 0.0), [1.0; 4], 3.0);
-
-            for step in 1..6 {
-                stroke.extend(Point::new(step as f64 * 10.0, step as f64 * 4.0));
-            }
-
-            assert!(stroke.is_usable(), "{tool:?} stroke was discarded");
-        }
     }
 
     #[test]

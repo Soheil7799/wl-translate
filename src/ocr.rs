@@ -13,8 +13,11 @@ pub struct Ocr {
 
 impl Ocr {
     /// `langs` is tesseract's `+`-joined form, e.g. `eng+ita+fas`.
-    pub fn new(langs: &str) -> Result<Self> {
-        let engine = LepTess::new(None, langs).with_context(|| {
+    ///
+    /// `datapath` overrides where the models come from, which is how a better
+    /// set than the distribution's can be used without touching system files.
+    pub fn new(datapath: Option<&str>, langs: &str) -> Result<Self> {
+        let engine = LepTess::new(datapath, langs).with_context(|| {
             format!(
                 "tesseract init failed for '{langs}' - missing language data? \
                  install with: sudo pacman -S {}",
