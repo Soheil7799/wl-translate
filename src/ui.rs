@@ -155,9 +155,29 @@ fn spawn_worker(
     events: async_channel::Sender<Event>,
 ) {
     std::thread::spawn(move || {
+        use std::sync::mpsc::RecvTimeoutError;
+
+        // Long enough that a working session never pays for a reload, short
+        // enough that a daemon left running overnight is not holding the
+        // language models the whole time.
+        const IDLE: Duration = Duration::from_secs(180);
+
         let mut worker = Worker::new(langs);
 
-        while let Ok(job) = jobs.recv() {
+        let job = loop {
+            match jobs.recv_timeout(IDLE) {
+                Ok(job) => break job,
+                Err(RecvTimeoutError::Timeout) => {
+                    worker.rest();
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        };
+
+        let mut job = job;
+
+        loop {
             let event = match worker.run(&job) {
                 Ok(Some(Product::Text(outcome))) => Event::Finished(outcome),
                 Ok(Some(Product::Shot(capture))) => Event::Captured(capture),
@@ -166,8 +186,19 @@ fn spawn_worker(
             };
 
             if events.send_blocking(event).is_err() {
-                break; // UI is gone
+                return; // UI is gone
             }
+
+            job = loop {
+                match jobs.recv_timeout(IDLE) {
+                    Ok(job) => break job,
+                    Err(RecvTimeoutError::Timeout) => {
+                        worker.rest();
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+            };
         }
     });
 }
@@ -285,6 +316,26 @@ fn build_window(app: &gtk::Application, jobs: std::sync::mpsc::Sender<Job>) -> W
     {
         let window = window.clone();
         close.connect_clicked(move |_| window.set_visible(false));
+    }
+
+    // Esc closes it. The window is opened by a keybind and glanced at, so
+    // reaching for the mouse to dismiss it breaks the flow it exists to serve.
+    {
+        let keys = gtk::EventControllerKey::new();
+        // Cloned for the closure; the original still has to receive the
+        // controller afterwards.
+        let target = window.clone();
+
+        keys.connect_key_pressed(move |_controller, key, _code, _modifiers| {
+            if key == gtk::gdk::Key::Escape {
+                target.set_visible(false);
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+
+        window.add_controller(keys);
     }
 
     {
@@ -459,8 +510,19 @@ impl Window {
         self.target.buffer().set_text(&outcome.translation);
         self.quiet.set(false);
 
-        self.status
-            .set_text(&format!("{} \u{2192} {}", outcome.from, outcome.to));
+        // Say when the source was guessed rather than chosen. A wrong guess
+        // otherwise only shows up as a translation that makes no sense, with
+        // nothing on screen hinting at why.
+        let detected = self.settings.borrow().source == "auto";
+
+        self.status.set_text(&if detected {
+            format!(
+                "detected {} \u{2192} {}   \u{00b7}   click a language to correct it",
+                outcome.from, outcome.to
+            )
+        } else {
+            format!("{} \u{2192} {}", outcome.from, outcome.to)
+        });
 
         self.present();
     }

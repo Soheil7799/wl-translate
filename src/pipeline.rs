@@ -161,6 +161,18 @@ impl Worker {
         Ok(Some(self.engine()?.recognize(&image)?))
     }
 
+    /// Drop the OCR engine.
+    ///
+    /// tesseract memory-maps its language models, and the better ones are not
+    /// small: with eng, ita and fas from tessdata_best resident the daemon sits
+    /// on well over a hundred megabytes for as long as it runs, almost all of
+    /// it mapped model data it is not using. Letting it go when idle costs one
+    /// reload - a few hundred milliseconds on the next capture - and gives back
+    /// the memory for the hours in between.
+    pub fn rest(&mut self) {
+        self.ocr = None;
+    }
+
     fn engine(&mut self) -> Result<&mut ocr::Ocr> {
         if self.ocr.is_none() {
             self.ocr = Some(ocr::Ocr::new(self.tessdata.as_deref(), &self.langs)?);
