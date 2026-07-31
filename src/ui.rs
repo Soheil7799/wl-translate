@@ -120,10 +120,19 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
         Message::Trigger(Verb::Show) => show(state),
 
+        // Deliberately does NOT open the window.
+        //
+        // For OCR the very next thing that happens is slurp taking over the
+        // screen for a region drag, and a window appearing first is both a
+        // distraction and a focus thief. For the other verbs the result is
+        // ~150ms away, so waiting means the window appears already filled in
+        // rather than blank. Either way the window belongs to the result, not
+        // to the request.
         Message::Trigger(verb) => {
-            state.status = Some("working...".into());
-            let dispatched = dispatch(state, verb);
-            Task::batch([dispatched, show(state)])
+            if state.window.is_some() {
+                state.status = Some("working...".into());
+            }
+            dispatch(state, verb)
         }
 
         Message::Finished(outcome) => {
