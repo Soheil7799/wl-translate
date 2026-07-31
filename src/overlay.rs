@@ -38,6 +38,9 @@ struct State {
     undone: Vec<Annotation>,
     ink: [f64; 4],
     width: f64,
+    /// Kept so the active indicator can be moved without rebuilding the strip.
+    tool_buttons: Vec<(Option<Tool>, gtk::Button)>,
+    swatches: Vec<gtk::DrawingArea>,
 }
 
 #[derive(Clone, Copy)]
@@ -91,6 +94,8 @@ pub fn present(
         undone: Vec::new(),
         ink: annotate::PALETTE[0].1,
         width: annotate::WIDTHS[1],
+        tool_buttons: Vec::new(),
+        swatches: Vec::new(),
     }));
 
     let window = gtk::ApplicationWindow::builder()
@@ -312,6 +317,43 @@ fn wire_pointer(canvas: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
     }
 
     canvas.add_controller(drag);
+
+    // The pointer should say what a drag here would do, before you commit to
+    // it: a crosshair to draw a region, a four-way arrow to move one, and the
+    // matching diagonal to resize from a corner.
+    let motion = gtk::EventControllerMotion::new();
+
+    {
+        let state = state.clone();
+        let canvas = canvas.clone();
+
+        motion.connect_motion(move |_controller, x, y| {
+            let at = Point::new(x, y);
+            let state = state.borrow();
+
+            let name = if state.tool.is_some() {
+                "crosshair"
+            } else {
+                match state.selection {
+                    Some(rect) => match geom::nearest_corner(rect, at) {
+                        Some(geom::Corner::TopLeft) | Some(geom::Corner::BottomRight) => {
+                            "nwse-resize"
+                        }
+                        Some(geom::Corner::TopRight) | Some(geom::Corner::BottomLeft) => {
+                            "nesw-resize"
+                        }
+                        None if rect.contains(at) => "move",
+                        None => "crosshair",
+                    },
+                    None => "crosshair",
+                }
+            };
+
+            canvas.set_cursor_from_name(Some(name));
+        });
+    }
+
+    canvas.add_controller(motion);
 }
 
 fn wire_keys(
@@ -347,8 +389,7 @@ fn wire_keys(
                 let holding = state.borrow().tool.is_some();
 
                 if holding {
-                    state.borrow_mut().tool = None;
-                    canvas.queue_draw();
+                    set_tool(&state, &canvas, None);
                 } else {
                     owner.close();
                     finished(Done::Cancelled);
@@ -373,12 +414,13 @@ fn wire_keys(
                 }
                 canvas.queue_draw();
             }
-            gdk::Key::p => set_tool(&state, &canvas, Tool::Pen),
-            gdk::Key::a => set_tool(&state, &canvas, Tool::Arrow),
-            gdk::Key::r => set_tool(&state, &canvas, Tool::Rectangle),
-            gdk::Key::o => set_tool(&state, &canvas, Tool::Ellipse),
-            gdk::Key::h => set_tool(&state, &canvas, Tool::Highlight),
-            gdk::Key::b => set_tool(&state, &canvas, Tool::Blur),
+            gdk::Key::v => set_tool(&state, &canvas, None),
+            gdk::Key::p => set_tool(&state, &canvas, Some(Tool::Pen)),
+            gdk::Key::a => set_tool(&state, &canvas, Some(Tool::Arrow)),
+            gdk::Key::r => set_tool(&state, &canvas, Some(Tool::Rectangle)),
+            gdk::Key::o => set_tool(&state, &canvas, Some(Tool::Ellipse)),
+            gdk::Key::h => set_tool(&state, &canvas, Some(Tool::Highlight)),
+            gdk::Key::b => set_tool(&state, &canvas, Some(Tool::Blur)),
             gdk::Key::w => {
                 let mut state = state.borrow_mut();
                 let next = annotate::WIDTHS
@@ -395,6 +437,7 @@ fn wire_keys(
 
                     if index >= 1 && index <= annotate::PALETTE.len() {
                         state.borrow_mut().ink = annotate::PALETTE[index - 1].1;
+                        pick_colour(&state);
                     }
                 }
                 return glib::Propagation::Proceed;
@@ -407,15 +450,37 @@ fn wire_keys(
     window.add_controller(keys);
 }
 
-fn set_tool(state: &Rc<RefCell<State>>, canvas: &gtk::DrawingArea, tool: Tool) {
-    let mut state = state.borrow_mut();
+/// Choose a tool. `None` is the select/move tool, which is a tool like any
+/// other rather than the absence of one.
+///
+/// Deliberately sets rather than toggles: clicking the tool you are already
+/// holding used to switch you back to selecting, which meant a stray second
+/// click silently changed what the next drag would do. Going back to selecting
+/// is now its own button, so the mode is always something you chose.
+fn set_tool(state: &Rc<RefCell<State>>, canvas: &gtk::DrawingArea, tool: Option<Tool>) {
+    {
+        let mut state = state.borrow_mut();
+        state.tool = tool;
+        state.drawing = None;
+    }
 
-    // Picking the tool you already hold goes back to selecting, so one key both
-    // enters and leaves a tool.
-    state.tool = if state.tool == Some(tool) { None } else { Some(tool) };
-    state.drawing = None;
-
+    refresh_tools(state);
     canvas.queue_draw();
+}
+
+/// Re-mark which tool button is active. Tools and colours have separate
+/// indicators on purpose: they are independent choices, and sharing one made
+/// picking a colour look like it had changed the tool.
+fn refresh_tools(state: &Rc<RefCell<State>>) {
+    let current = state.borrow().tool;
+
+    for (tool, button) in state.borrow().tool_buttons.iter() {
+        if *tool == current {
+            button.add_css_class("suggested-action");
+        } else {
+            button.remove_css_class("suggested-action");
+        }
+    }
 }
 
 // ── committing ─────────────────────────────────────────────────────────────
@@ -497,23 +562,41 @@ fn commit(state: &State, what: Commit) -> Done {
 fn tool_column(state: &Rc<RefCell<State>>, canvas: &gtk::DrawingArea) -> gtk::Widget {
     let tools = gtk::Box::new(gtk::Orientation::Vertical, 4);
 
-    for (tool, icon) in [
-        (Tool::Pen, "document-edit-symbolic"),
-        (Tool::Arrow, "go-next-symbolic"),
-        (Tool::Rectangle, "view-grid-symbolic"),
-        (Tool::Ellipse, "media-record-symbolic"),
-        (Tool::Highlight, "format-text-underline-symbolic"),
-        (Tool::Blur, "view-conceal-symbolic"),
+    for (tool, icon, tip) in [
+        (None, "object-select-symbolic", "Select and move  (v)"),
+        (Some(Tool::Pen), "document-edit-symbolic", Tool::Pen.label()),
+        (Some(Tool::Arrow), "go-next-symbolic", Tool::Arrow.label()),
+        (
+            Some(Tool::Rectangle),
+            "view-grid-symbolic",
+            Tool::Rectangle.label(),
+        ),
+        (
+            Some(Tool::Ellipse),
+            "media-record-symbolic",
+            Tool::Ellipse.label(),
+        ),
+        (
+            Some(Tool::Highlight),
+            "format-text-underline-symbolic",
+            Tool::Highlight.label(),
+        ),
+        (Some(Tool::Blur), "view-conceal-symbolic", Tool::Blur.label()),
     ] {
         let button = gtk::Button::from_icon_name(icon);
-        button.set_tooltip_text(Some(tool.label()));
+        button.set_tooltip_text(Some(tip));
 
-        let state = state.clone();
-        let canvas = canvas.clone();
-        button.connect_clicked(move |_| set_tool(&state, &canvas, tool));
+        {
+            let state = state.clone();
+            let canvas = canvas.clone();
+            button.connect_clicked(move |_| set_tool(&state, &canvas, tool));
+        }
 
+        state.borrow_mut().tool_buttons.push((tool, button.clone()));
         tools.append(&button);
     }
+
+    refresh_tools(state);
 
     let undo = gtk::Button::from_icon_name("edit-undo-symbolic");
     undo.set_tooltip_text(Some("Undo  (Ctrl+Z)"));
@@ -558,22 +641,40 @@ fn tool_column(state: &Rc<RefCell<State>>, canvas: &gtk::DrawingArea) -> gtk::Wi
         dot.set_size_request(16, 16);
 
         let ink = *ink;
-        dot.set_draw_func(move |_area, cr, width, height| {
-            cr.set_source_rgba(ink[0], ink[1], ink[2], 1.0);
-            cr.arc(
-                width as f64 / 2.0,
-                height as f64 / 2.0,
-                (width.min(height) as f64) / 2.0 - 1.0,
-                0.0,
-                std::f64::consts::TAU,
-            );
-            let _ = cr.fill();
-        });
+
+        {
+            // The selected colour is marked by a ring around its own swatch,
+            // not by the button styling the tools use - otherwise picking a
+            // colour looks like it changed which tool is active.
+            let state = state.clone();
+
+            dot.set_draw_func(move |_area, cr, width, height| {
+                let centre = (width as f64 / 2.0, height as f64 / 2.0);
+                let radius = (width.min(height) as f64) / 2.0 - 2.0;
+
+                cr.set_source_rgba(ink[0], ink[1], ink[2], 1.0);
+                cr.arc(centre.0, centre.1, radius, 0.0, std::f64::consts::TAU);
+                let _ = cr.fill();
+
+                if state.borrow().ink == ink {
+                    cr.set_source_rgb(1.0, 1.0, 1.0);
+                    cr.set_line_width(2.0);
+                    cr.arc(centre.0, centre.1, radius + 1.0, 0.0, std::f64::consts::TAU);
+                    let _ = cr.stroke();
+                }
+            });
+        }
 
         swatch.set_child(Some(&dot));
+        state.borrow_mut().swatches.push(dot.clone());
 
-        let state = state.clone();
-        swatch.connect_clicked(move |_| state.borrow_mut().ink = ink);
+        {
+            let state = state.clone();
+            swatch.connect_clicked(move |_| {
+                state.borrow_mut().ink = ink;
+                pick_colour(&state);
+            });
+        }
 
         colors.append(&swatch);
     }
@@ -587,6 +688,13 @@ fn tool_column(state: &Rc<RefCell<State>>, canvas: &gtk::DrawingArea) -> gtk::Wi
     strip.add_css_class("osd");
 
     strip.upcast()
+}
+
+/// Redraw every swatch so the ring follows the choice.
+fn pick_colour(state: &Rc<RefCell<State>>) {
+    for swatch in state.borrow().swatches.iter() {
+        swatch.queue_draw();
+    }
 }
 
 fn action_bar(
