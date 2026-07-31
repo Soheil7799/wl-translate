@@ -45,6 +45,11 @@ iced = { version = "0.14.0", default-features = false, features = [
 ] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+# Already in the tree as iced's fallback renderer. Used directly to bake
+# annotations into the saved PNG with a real anti-aliased rasteriser, rather
+# than hand-rolling line and arrow drawing over raw pixels.
+tiny-skia = { version = "0.11", features = ["png-format"] }
+
 # D-Bus, on tokio so it shares iced's runtime rather than dragging in async-io.
 zbus = { version = "5.18.0", default-features = false, features = ["tokio"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }

@@ -8,6 +8,7 @@
 //! in the window and remembered, not something a keybind should restate. The
 //! flags below exist for scripting and are never needed day to day.
 
+mod annotate;
 mod capture;
 mod clip;
 mod ipc;

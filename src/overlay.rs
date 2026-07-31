@@ -10,6 +10,7 @@
 //! canvas lays out in logical points. Everything here works in canvas points
 //! and converts once, at the edge, in [`Selection::to_pixels`].
 
+use crate::annotate::{Annotation, Tool};
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
 use iced::{Color, Point, Rectangle, Renderer, Size, Theme};
@@ -64,9 +65,23 @@ enum Drag {
     Resize { anchor: Point },
 }
 
+/// What the canvas reports back. Selecting and drawing are the same drag
+/// gesture in different modes, so they share one channel.
+#[derive(Debug, Clone)]
+pub enum Action {
+    Select(Selection),
+    /// Start a stroke at this point.
+    Begin(Point),
+    /// Continue the stroke in progress.
+    Extend(Point),
+    /// The stroke is done.
+    Finish,
+}
+
 #[derive(Default)]
 pub struct State {
     drag: Option<Drag>,
+    drawing: bool,
 }
 
 /// The canvas program. Rebuilt each frame from the app state, so the current
@@ -77,13 +92,18 @@ pub struct State {
 /// separate passes: an image drawn inside the canvas ends up on top of the
 /// dimming regardless of the order the calls were made in, which is exactly
 /// the bug that made the first overlay look undimmed.
-pub struct Selector {
+pub struct Selector<'a> {
     pub selection: Option<Selection>,
+    /// `None` means the drag selects; anything else means it draws.
+    pub tool: Option<Tool>,
+    pub annotations: &'a [Annotation],
+    /// The stroke currently under the pointer, drawn but not yet committed.
+    pub drawing: Option<&'a Annotation>,
 }
 
-impl<Message> canvas::Program<Message> for Selector
+impl<Message> canvas::Program<Message> for Selector<'_>
 where
-    Message: From<Selection> + Clone,
+    Message: From<Action> + Clone,
 {
     type State = State;
 
@@ -96,6 +116,27 @@ where
     ) -> Option<canvas::Action<Message>> {
         let position = cursor.position_in(bounds)?;
 
+        // With a tool picked, the same drag gesture draws instead of selecting.
+        if self.tool.is_some() {
+            return match event {
+                iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                    state.drawing = true;
+                    Some(canvas::Action::publish(Message::from(Action::Begin(position))).and_capture())
+                }
+
+                iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.drawing => {
+                    Some(canvas::Action::publish(Message::from(Action::Extend(position))).and_capture())
+                }
+
+                iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    state.drawing = false;
+                    Some(canvas::Action::publish(Message::from(Action::Finish)).and_capture())
+                }
+
+                _ => None,
+            };
+        }
+
         match event {
             iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 state.drag = Some(self.grab(position));
@@ -106,7 +147,7 @@ where
                 let drag = state.drag?;
                 let selection = self.apply(drag, position, bounds);
 
-                Some(canvas::Action::publish(Message::from(selection)).and_capture())
+                Some(canvas::Action::publish(Message::from(Action::Select(selection))).and_capture())
             }
 
             iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
@@ -161,6 +202,30 @@ where
         // its key, and the two disagreed with each other as soon as the buttons
         // gained their own shortcuts.
 
+        // Annotations last, so they sit above the dimming: something drawn just
+        // outside the selection still has to be visible while you draw it, even
+        // though the crop will discard it.
+        for annotation in self.annotations.iter().chain(self.drawing) {
+            let [red, green, blue, alpha] = annotation.color;
+            let stroke = Stroke::default()
+                .with_color(Color::from_rgba(red, green, blue, alpha))
+                .with_width(annotation.width);
+
+            for line in crate::annotate::outline(annotation) {
+                let mut path = iced::widget::canvas::path::Builder::new();
+
+                for (index, point) in line.iter().enumerate() {
+                    if index == 0 {
+                        path.move_to(*point);
+                    } else {
+                        path.line_to(*point);
+                    }
+                }
+
+                frame.stroke(&path.build(), stroke.clone());
+            }
+        }
+
         vec![frame.into_geometry()]
     }
 
@@ -173,6 +238,12 @@ where
         let Some(position) = cursor.position_in(bounds) else {
             return mouse::Interaction::default();
         };
+
+        // While a tool is active every drag draws, so the resize and move
+        // affordances would be lying.
+        if self.tool.is_some() {
+            return mouse::Interaction::Crosshair;
+        }
 
         let Some(rect) = self.selection.map(|selection| selection.0) else {
             return mouse::Interaction::Crosshair;
@@ -190,7 +261,7 @@ where
     }
 }
 
-impl Selector {
+impl Selector<'_> {
     /// Decide what a press at `position` starts: resizing from a corner,
     /// moving the whole selection, or drawing a new one.
     fn grab(&self, position: Point) -> Drag {

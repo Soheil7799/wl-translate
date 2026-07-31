@@ -27,6 +27,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use crate::clip;
 use crate::ipc;
 use crate::pipeline::{Job, Outcome, Product, Verb, Worker};
+use crate::annotate::{self, Annotation, Tool};
 use crate::overlay::{self, Selection};
 use crate::shot;
 use crate::settings::Settings;
@@ -53,8 +54,14 @@ pub enum Message {
     Closed(window::Id),
     /// A frozen output came back; the overlay picks a region out of it.
     Captured(shot::Capture),
-    /// The selection changed while dragging.
-    Select(Selection),
+    /// Something happened on the overlay canvas: a selection drag, or a stroke.
+    Canvas(overlay::Action),
+    /// Pick a drawing tool, or `None` to go back to selecting.
+    PickTool(Option<Tool>),
+    /// Drop the last annotation.
+    Undo,
+    /// Esc: leave the current tool, or close if there is none.
+    EscapeOverlay,
     PreviewOpened(window::Id),
     /// What to do with the selected region. Each has a button and a key.
     Shot(Commit),
@@ -119,12 +126,17 @@ struct Overlay {
     selection: Option<Selection>,
     /// Output size in logical points, for deciding where the toolbar goes.
     screen: Option<iced::Size>,
+    /// `None` means drags select; anything else means they draw.
+    tool: Option<Tool>,
+    annotations: Vec<Annotation>,
+    /// The stroke under the pointer right now.
+    drawing: Option<Annotation>,
 }
 
 /// The canvas asks for this so a drag can report itself.
-impl From<Selection> for Message {
-    fn from(selection: Selection) -> Self {
-        Message::Select(selection)
+impl From<overlay::Action> for Message {
+    fn from(action: overlay::Action) -> Self {
+        Message::Canvas(action)
     }
 }
 
@@ -256,14 +268,61 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 capture,
                 selection,
                 screen,
+                tool: None,
+                annotations: Vec::new(),
+                drawing: None,
             });
 
             show_overlay(state)
         }
 
-        Message::Select(selection) => {
+        Message::Canvas(action) => {
+            let Some(overlay) = &mut state.overlay else {
+                return Task::none();
+            };
+
+            match action {
+                overlay::Action::Select(selection) => overlay.selection = Some(selection),
+
+                overlay::Action::Begin(at) => {
+                    if let Some(tool) = overlay.tool {
+                        overlay.drawing = Some(Annotation::new(tool, at, INK, PEN_WIDTH));
+                    }
+                }
+
+                overlay::Action::Extend(to) => {
+                    if let Some(drawing) = &mut overlay.drawing {
+                        drawing.extend(to);
+                    }
+                }
+
+                // A click that drew nothing is dropped rather than left as an
+                // invisible entry that Undo would appear to ignore.
+                overlay::Action::Finish => {
+                    if let Some(drawing) = overlay.drawing.take() {
+                        if drawing.is_usable() {
+                            overlay.annotations.push(drawing);
+                        }
+                    }
+                }
+            }
+
+            Task::none()
+        }
+
+        Message::PickTool(tool) => {
             if let Some(overlay) = &mut state.overlay {
-                overlay.selection = Some(selection);
+                // Picking the tool you already hold puts the mouse back to
+                // selecting, so one key both enters and leaves a tool.
+                overlay.tool = if overlay.tool == tool { None } else { tool };
+                overlay.drawing = None;
+            }
+            Task::none()
+        }
+
+        Message::Undo => {
+            if let Some(overlay) = &mut state.overlay {
+                overlay.annotations.pop();
             }
             Task::none()
         }
@@ -274,6 +333,19 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
 
         Message::Shot(what) => commit(state, what),
+
+        Message::EscapeOverlay => {
+            let holding_tool = state
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.tool.is_some());
+
+            if holding_tool {
+                update(state, Message::PickTool(None))
+            } else {
+                commit(state, Commit::Close)
+            }
+        }
 
         Message::SourceEdit(action) => {
             let changed = action.is_edit();
@@ -446,6 +518,27 @@ fn commit(state: &mut State, what: Commit) -> Task<Message> {
         }
     };
 
+    // Annotations are recorded in screen points; the crop starts at the
+    // selection's corner, so shifting by that and scaling lands them exactly
+    // where they were drawn. Anything outside the crop falls off the pixmap.
+    let origin = overlay
+        .selection
+        .map(|selection| selection.0.position())
+        .unwrap_or(iced::Point::ORIGIN);
+
+    let cropped = match annotate::rasterize(
+        &overlay.annotations,
+        &cropped,
+        origin,
+        overlay.capture.scale,
+    ) {
+        Ok(annotated) => annotated,
+        Err(error) => {
+            state.status = Some(format!("{error:#}"));
+            return close_overlay(state);
+        }
+    };
+
     match what {
         Commit::Copy => {
             state.status = match shot::copy_image(&cropped) {
@@ -545,7 +638,12 @@ fn close_overlay(state: &mut State) -> Task<Message> {
 
 /// Height of the toolbar strip, used both to lay it out and to decide which
 /// screen edge it can sit on without covering the selection.
-const TOOLBAR: f32 = 72.0;
+const TOOLBAR: f32 = 116.0;
+
+/// Annotation colour and stroke width. Red at three points is what every
+/// screenshot tool defaults to, and it reads on both light and dark captures.
+const INK: [f32; 4] = [0.92, 0.19, 0.21, 1.0];
+const PEN_WIDTH: f32 = 3.0;
 
 /// The action buttons, stuck to whichever screen edge the selection leaves
 /// clear. They do not follow the selection around - they only get out of its
@@ -557,7 +655,7 @@ fn toolbar(overlay: &Overlay) -> Element<'_, Message> {
 
     let anchor = overlay::toolbar_anchor(overlay.selection, screen, TOOLBAR);
 
-    let buttons = [
+    let actions = [
         Commit::Copy,
         Commit::Save,
         Commit::Extract,
@@ -569,7 +667,28 @@ fn toolbar(overlay: &Overlay) -> Element<'_, Message> {
         strip.push(button(text(action.label()).size(12)).on_press(Message::Shot(action)))
     });
 
-    container(buttons)
+    let tools = [Tool::Pen, Tool::Arrow, Tool::Rectangle, Tool::Ellipse]
+        .into_iter()
+        .fold(row![].spacing(8), |strip, tool| {
+            let chip = button(text(tool.label()).size(12)).on_press(Message::PickTool(Some(tool)));
+
+            strip.push(if overlay.tool == Some(tool) {
+                chip.style(button::primary)
+            } else {
+                chip.style(button::secondary)
+            })
+        })
+        .push(
+            button(text("Undo  (Ctrl+Z)").size(12))
+                .style(button::secondary)
+                .on_press(Message::Undo),
+        );
+
+    container(
+        column![tools, actions]
+            .spacing(8)
+            .align_x(Alignment::Center),
+    )
         .width(Length::Fill)
         .height(Length::Fill)
         .align_x(Alignment::Center)
@@ -597,6 +716,9 @@ fn view(state: &State, window_id: window::Id) -> Element<'_, Message> {
                 .push(
                     iced::widget::Canvas::new(overlay::Selector {
                         selection: overlay.selection,
+                        tool: overlay.tool,
+                        annotations: &overlay.annotations,
+                        drawing: overlay.drawing.as_ref(),
                     })
                     .width(Length::Fill)
                     .height(Length::Fill),
@@ -737,8 +859,16 @@ fn review_key(event: iced::keyboard::Event) -> Message {
 
     match key {
         Key::Named(Named::Enter | Named::Space) => Message::Shot(Commit::Save),
-        Key::Named(Named::Escape) => Message::Shot(Commit::Close),
+        // Esc backs out of a tool first, and only closes once the mouse is
+        // selecting again - so it never throws away a capture you were still
+        // drawing on.
+        Key::Named(Named::Escape) => Message::EscapeOverlay,
         Key::Character(character) => match character.as_str() {
+            "z" if modifiers.control() => Message::Undo,
+            "p" => Message::PickTool(Some(Tool::Pen)),
+            "a" => Message::PickTool(Some(Tool::Arrow)),
+            "r" => Message::PickTool(Some(Tool::Rectangle)),
+            "o" => Message::PickTool(Some(Tool::Ellipse)),
             // Ctrl+C as well as plain c, since one is muscle memory and the
             // other is what the button says.
             "c" => Message::Shot(Commit::Copy),
