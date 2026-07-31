@@ -17,8 +17,13 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::pipeline::Verb;
 use crate::shot;
 
-pub const SERVICE: &str = "org.wl_translate.Daemon";
-pub const PATH: &str = "/org/wl_translate/Daemon";
+// Distinct from the GTK translator daemon on purpose. While both binaries
+// exist they are separate programs with separate windows, and a shared bus name
+// means whichever starts first answers for both - which had this build handing
+// its screenshots to a daemon that has no overlay to show them in, so they
+// vanished silently.
+pub const SERVICE: &str = "org.wl_translate.Shot";
+pub const PATH: &str = "/org/wl_translate/Shot";
 
 /// Server side. Each method drops a verb on the channel and returns at once -
 /// the caller is a keybind, so it must never block waiting for OCR.
