@@ -7,6 +7,7 @@
 
 use anyhow::Result;
 
+use crate::shot;
 use crate::{capture, ocr, translate};
 
 /// Where the text comes from.
@@ -21,6 +22,9 @@ pub enum Verb {
     Selection,
     Clipboard,
     Text(String),
+    /// Take a screenshot. The bytes come back for review rather than being
+    /// written straight out, so the keypress decides what happens to them.
+    Shot(shot::Mode),
     /// Raise the window without changing its contents. Handled by the UI, never
     /// reaches the worker.
     Show,
@@ -54,6 +58,15 @@ impl Job {
     }
 }
 
+/// What a job produced. Screenshots are not text, so they cannot ride in an
+/// `Outcome` - the UI has to be able to tell the two apart.
+#[derive(Debug, Clone)]
+pub enum Product {
+    Text(Outcome),
+    /// PNG bytes, deliberately not yet saved or copied.
+    Shot(Vec<u8>),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Outcome {
     pub source: String,
@@ -81,7 +94,12 @@ impl Worker {
 
     /// Run one job. `Ok(None)` means there was nothing to do - the user
     /// cancelled the region drag, or the verb was not ours to handle.
-    pub fn run(&mut self, job: &Job) -> Result<Option<Outcome>> {
+    pub fn run(&mut self, job: &Job) -> Result<Option<Product>> {
+        // Screenshots short-circuit the whole text pipeline.
+        if let Verb::Shot(mode) = &job.verb {
+            return Ok(shot::capture(*mode, job.freeze)?.map(Product::Shot));
+        }
+
         let Some(source) = self.read_source(job)? else {
             return Ok(None);
         };
@@ -89,27 +107,27 @@ impl Worker {
         anyhow::ensure!(!source.is_empty(), "no text found");
 
         if job.verb.is_raw() {
-            return Ok(Some(Outcome {
+            return Ok(Some(Product::Text(Outcome {
                 translation: source.clone(),
                 source,
                 from: job.from.clone(),
                 to: job.to.clone(),
-            }));
+            })));
         }
 
         let result = translate::backend(&job.engine)?.translate(&source, &job.from, &job.to)?;
 
-        Ok(Some(Outcome {
+        Ok(Some(Product::Text(Outcome {
             source,
             translation: result.text,
             from: result.detected.unwrap_or_else(|| job.from.clone()),
             to: job.to.clone(),
-        }))
+        })))
     }
 
     fn read_source(&mut self, job: &Job) -> Result<Option<String>> {
         Ok(match &job.verb {
-            Verb::Show => None,
+            Verb::Show | Verb::Shot(_) => None,
             Verb::Text(text) => Some(text.clone()),
             Verb::Selection => Some(crate::clip::primary()?),
             Verb::Clipboard => Some(crate::clip::clipboard()?),

@@ -48,7 +48,28 @@ wl-translate ocr           # drag a region, OCR it, translate
 wl-translate ocr --raw     # drag a region, just extract the text
 wl-translate text "ciao"   # translate an argument
 wl-translate show          # raise the window as it is
+
+wl-translate shot          # drag a region and review it
+wl-translate shot window   # pick a window
+wl-translate shot screen   # the focused output
 ```
+
+## Screenshots
+
+The screen is held still while you drag, so a video or a scrolling page cannot
+move out from under the selection. What you capture is then shown for review and
+nothing is committed until you say so:
+
+| key | does |
+|---|---|
+| `Enter` / `Space` | save to disk **and** copy |
+| `Ctrl+C` | copy only, no file |
+| `Esc` | discard |
+
+Files land in `<pictures>/Screenshots/Screenshot_<timestamp>.png`.
+
+With no daemon running there is no window to review in, so a shot copies and
+saves immediately instead.
 
 Flags exist for scripting and are never needed day to day:
 

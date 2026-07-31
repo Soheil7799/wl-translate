@@ -20,13 +20,14 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use iced::futures::{SinkExt, Stream};
-use iced::widget::{button, column, container, row, rule, text, text_editor};
+use iced::widget::{button, column, container, image, row, rule, text, text_editor};
 use iced::{window, Alignment, Element, Length, Subscription, Task, Theme};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::clip;
 use crate::ipc;
-use crate::pipeline::{Job, Outcome, Verb, Worker};
+use crate::pipeline::{Job, Outcome, Product, Verb, Worker};
+use crate::shot;
 use crate::settings::Settings;
 
 /// Tesseract languages for the daemon's OCR engine. A `Subscription` is built
@@ -49,6 +50,15 @@ pub enum Message {
     /// The window went away by some route other than our Close button. Without
     /// this the stored id outlives the window and we never open another.
     Closed(window::Id),
+    /// A screenshot came back, held for review rather than written out.
+    Shot(Vec<u8>),
+    PreviewOpened(window::Id),
+    /// Enter / Space: keep it - save to disk and copy.
+    ShotKeep,
+    /// Ctrl+C: copy only, leave no file behind.
+    ShotCopy,
+    /// Esc: throw it away.
+    ShotDiscard,
     SourceEdit(text_editor::Action),
     TargetEdit(text_editor::Action),
     PickSource(String),
@@ -72,6 +82,15 @@ pub struct State {
     status: Option<String>,
     /// Bumped on every edit so a stale debounce tick can be ignored.
     generation: u64,
+    /// A captured screenshot awaiting a decision.
+    preview: Option<Preview>,
+    preview_window: Option<window::Id>,
+}
+
+/// A screenshot on screen but not yet committed anywhere.
+struct Preview {
+    png: Vec<u8>,
+    handle: image::Handle,
 }
 
 impl State {
@@ -85,6 +104,8 @@ impl State {
             detected: None,
             status: None,
             generation: 0,
+            preview: None,
+            preview_window: None,
         }
     }
 }
@@ -104,7 +125,15 @@ pub fn run(langs: Option<String>) -> anyhow::Result<()> {
         id: Some("wl-translate".to_string()),
         ..Default::default()
     })
-    .title(|_state: &State, _id| "wl-translate".to_string())
+    // Distinct titles so compositor rules can size the review window
+    // differently from the translation window; they share a class.
+    .title(|state: &State, id| {
+        if state.preview_window == Some(id) {
+            "wl-translate screenshot".to_string()
+        } else {
+            "wl-translate".to_string()
+        }
+    })
     .theme(|_state: &State, _id| Theme::Dark)
     .subscription(subscription)
     .run()
@@ -157,8 +186,50 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if state.window == Some(id) {
                 state.window = None;
             }
+            if state.preview_window == Some(id) {
+                state.preview_window = None;
+                state.preview = None;
+            }
             Task::none()
         }
+
+        Message::Shot(png) => {
+            state.preview = Some(Preview {
+                handle: image::Handle::from_bytes(png.clone()),
+                png,
+            });
+            show_preview(state)
+        }
+
+        Message::PreviewOpened(id) => {
+            state.preview_window = Some(id);
+            Task::none()
+        }
+
+        Message::ShotKeep => {
+            let saved = state.preview.as_ref().map(|preview| {
+                let _ = shot::copy_image(&preview.png);
+                shot::save(&preview.png)
+            });
+
+            match saved {
+                Some(Ok(path)) => state.status = Some(format!("saved {}", path.display())),
+                Some(Err(error)) => state.status = Some(format!("{error:#}")),
+                None => {}
+            }
+
+            close_preview(state)
+        }
+
+        Message::ShotCopy => {
+            if let Some(preview) = &state.preview {
+                let _ = shot::copy_image(&preview.png);
+                state.status = Some("copied".into());
+            }
+            close_preview(state)
+        }
+
+        Message::ShotDiscard => close_preview(state),
 
         Message::SourceEdit(action) => {
             let changed = action.is_edit();
@@ -292,7 +363,70 @@ fn show(state: &mut State) -> Task<Message> {
     task.map(Message::Opened)
 }
 
-fn view(state: &State, _window: window::Id) -> Element<'_, Message> {
+fn show_preview(state: &mut State) -> Task<Message> {
+    if state.preview_window.is_some() {
+        return Task::none();
+    }
+
+    let (id, task) = window::open(window::Settings {
+        size: iced::Size::new(900.0, 620.0),
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: "wl-translate".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    state.preview_window = Some(id);
+    task.map(Message::PreviewOpened)
+}
+
+fn close_preview(state: &mut State) -> Task<Message> {
+    state.preview = None;
+
+    match state.preview_window.take() {
+        Some(id) => window::close(id),
+        None => Task::none(),
+    }
+}
+
+/// The captured image, with what each key does spelled out underneath. The
+/// shot is not on disk or on the clipboard yet - the keypress decides.
+fn preview_view(preview: &Preview) -> Element<'_, Message> {
+    column![
+        container(
+            image(preview.handle.clone()).content_fit(iced::ContentFit::Contain)
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill),
+        row![
+            button(text("Save + copy  (Enter)").size(12)).on_press(Message::ShotKeep),
+            button(text("Copy only  (Ctrl+C)").size(12)).on_press(Message::ShotCopy),
+            button(text("Discard  (Esc)").size(12)).on_press(Message::ShotDiscard),
+        ]
+        .spacing(8),
+    ]
+    .spacing(10)
+    .into()
+}
+
+fn view(state: &State, window_id: window::Id) -> Element<'_, Message> {
+    if state.preview_window == Some(window_id) {
+        if let Some(preview) = &state.preview {
+            return container(preview_view(preview))
+                .padding(12)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        }
+    }
+
+    translate_view(state)
+}
+
+fn translate_view(state: &State) -> Element<'_, Message> {
     let source_label = match (&state.settings.source, &state.detected) {
         (source, Some(detected)) if source == "auto" => format!("auto - {detected}"),
         _ => String::new(),
@@ -399,14 +533,50 @@ fn subscription(_state: &State) -> Subscription<Message> {
     Subscription::batch([
         Subscription::run(events),
         window::close_events().map(Message::Closed),
-        iced::keyboard::listen().map(|event| match event {
-            iced::keyboard::Event::KeyPressed {
-                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-                ..
-            } => Message::Dismiss,
-            _ => Message::Ignore,
-        }),
+        if _state.preview_window.is_some() {
+            iced::keyboard::listen().map(review_key)
+        } else {
+            iced::keyboard::listen().map(translate_key)
+        },
     ])
+}
+
+/// While a screenshot is up for review, the keys commit or throw it away.
+fn review_key(event: iced::keyboard::Event) -> Message {
+    use iced::keyboard::key::Named;
+    use iced::keyboard::{Event, Key};
+
+    match event {
+        Event::KeyPressed {
+            key: Key::Named(Named::Enter | Named::Space),
+            ..
+        } => Message::ShotKeep,
+        Event::KeyPressed {
+            key: Key::Character(character),
+            modifiers,
+            ..
+        } if modifiers.control() && character.as_str().eq_ignore_ascii_case("c") => {
+            Message::ShotCopy
+        }
+        Event::KeyPressed {
+            key: Key::Named(Named::Escape),
+            ..
+        } => Message::ShotDiscard,
+        _ => Message::Ignore,
+    }
+}
+
+fn translate_key(event: iced::keyboard::Event) -> Message {
+    use iced::keyboard::key::Named;
+    use iced::keyboard::{Event, Key};
+
+    match event {
+        Event::KeyPressed {
+            key: Key::Named(Named::Escape),
+            ..
+        } => Message::Dismiss,
+        _ => Message::Ignore,
+    }
 }
 
 /// Owns the D-Bus server and the worker thread for as long as the daemon runs.
@@ -414,7 +584,7 @@ fn events() -> impl Stream<Item = Message> {
     iced::stream::channel(32, async |mut output| {
         let (trigger_tx, mut trigger_rx) = mpsc::unbounded_channel::<Verb>();
         let (job_tx, mut job_rx) = mpsc::unbounded_channel::<Job>();
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Result<Option<Outcome>, String>>();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Result<Option<Product>, String>>();
 
         let langs = LANGS.get().cloned().unwrap_or_else(|| "eng".to_string());
 
@@ -465,7 +635,8 @@ fn events() -> impl Stream<Item = Message> {
             let message = tokio::select! {
                 Some(verb) = trigger_rx.recv() => Message::Trigger(verb),
                 Some(result) = out_rx.recv() => match result {
-                    Ok(Some(outcome)) => Message::Finished(outcome),
+                    Ok(Some(Product::Text(outcome))) => Message::Finished(outcome),
+                    Ok(Some(Product::Shot(png))) => Message::Shot(png),
                     Ok(None) => continue, // cancelled drag, or a UI-only verb
                     Err(error) => Message::Failed(error),
                 },

@@ -36,6 +36,16 @@ impl std::str::FromStr for Mode {
     }
 }
 
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Mode::Region => "region",
+            Mode::Window => "window",
+            Mode::Screen => "screen",
+        })
+    }
+}
+
 pub struct Shot {
     pub png: Vec<u8>,
     pub saved: Option<PathBuf>,
@@ -49,19 +59,12 @@ pub fn take(mode: Mode, freeze: bool, save: bool) -> Result<Option<Shot>> {
 
     copy_image(&png)?;
 
-    let saved = if save {
-        let path = destination()?;
-        std::fs::write(&path, &png)
-            .with_context(|| format!("could not write {}", path.display()))?;
-        Some(path)
-    } else {
-        None
-    };
+    let saved = if save { Some(self::save(&png)?) } else { None };
 
     Ok(Some(Shot { png, saved }))
 }
 
-fn capture(mode: Mode, freeze: bool) -> Result<Option<Vec<u8>>> {
+pub fn capture(mode: Mode, freeze: bool) -> Result<Option<Vec<u8>>> {
     // Only the interactive modes need the screen held still, and as with OCR
     // the grab has to happen before the freeze is released.
     let frozen = match mode {
@@ -160,7 +163,7 @@ fn hyprctl(args: &[&str]) -> Result<Value> {
     serde_json::from_slice(&out.stdout).context("hyprctl returned invalid json")
 }
 
-fn copy_image(png: &[u8]) -> Result<()> {
+pub fn copy_image(png: &[u8]) -> Result<()> {
     use std::io::Write;
 
     let mut child = Command::new("wl-copy")
@@ -177,6 +180,13 @@ fn copy_image(png: &[u8]) -> Result<()> {
 
     child.wait()?;
     Ok(())
+}
+
+/// Write a captured PNG out and return where it went.
+pub fn save(png: &[u8]) -> Result<PathBuf> {
+    let path = destination()?;
+    std::fs::write(&path, png).with_context(|| format!("could not write {}", path.display()))?;
+    Ok(path)
 }
 
 /// `<pictures>/Screenshots/Screenshot_<timestamp>.png`.

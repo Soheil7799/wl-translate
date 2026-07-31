@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::pipeline::Verb;
+use crate::shot;
 
 pub const SERVICE: &str = "org.wl_translate.Daemon";
 pub const PATH: &str = "/org/wl_translate/Daemon";
@@ -52,6 +53,17 @@ impl Iface {
         let _ = self.triggers.send(Verb::Text(text));
     }
 
+    /// Take a screenshot and show it for review. Mode is region, window or
+    /// screen; anything else is ignored rather than crashing a keybind.
+    fn shot(&self, mode: String) {
+        match mode.parse::<shot::Mode>() {
+            Ok(mode) => {
+                let _ = self.triggers.send(Verb::Shot(mode));
+            }
+            Err(error) => eprintln!("wl-translate: {error}"),
+        }
+    }
+
     /// Raise the window without changing what is in it.
     fn show(&self) {
         let _ = self.triggers.send(Verb::Show);
@@ -69,6 +81,7 @@ pub trait Daemon {
     async fn selection(&self) -> zbus::Result<()>;
     async fn clipboard(&self) -> zbus::Result<()>;
     async fn text(&self, text: &str) -> zbus::Result<()>;
+    async fn shot(&self, mode: &str) -> zbus::Result<()>;
     async fn show(&self) -> zbus::Result<()>;
 }
 
@@ -95,6 +108,7 @@ pub fn forward(verb: &Verb) -> Result<bool> {
             Verb::Selection => proxy.selection().await,
             Verb::Clipboard => proxy.clipboard().await,
             Verb::Text(text) => proxy.text(text).await,
+            Verb::Shot(mode) => proxy.shot(&mode.to_string()).await,
             Verb::Show => proxy.show().await,
         };
 

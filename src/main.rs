@@ -23,7 +23,7 @@ use std::io::IsTerminal;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use pipeline::{Job, Outcome, Verb, Worker};
+use pipeline::{Job, Outcome, Product, Verb, Worker};
 use settings::Settings;
 
 #[derive(Parser)]
@@ -120,9 +120,18 @@ fn main() -> Result<()> {
     // Screenshots never involve the daemon: there is no OCR engine to keep warm
     // and no window to show, so forwarding would only add a hop.
     if let Command::Shot { mode, no_save } = &cli.command {
+        let mode: shot::Mode = mode.parse()?;
+
+        // With a daemon running the shot goes there, so it can be looked at
+        // before it is committed anywhere. Without one there is no window to
+        // review in, so it copies and saves straight away.
+        if !cli.no_daemon && ipc::forward(&Verb::Shot(mode))? {
+            return Ok(());
+        }
+
         let settings = Settings::load();
 
-        let Some(taken) = shot::take(mode.parse()?, settings.freeze, !no_save)? else {
+        let Some(taken) = shot::take(mode, settings.freeze, !no_save)? else {
             return Ok(()); // cancelled
         };
 
@@ -152,8 +161,13 @@ fn main() -> Result<()> {
     job.engine = cli.engine.clone().unwrap_or_else(|| settings.engine.clone());
     job.freeze = settings.freeze;
 
-    let Some(outcome) = Worker::new(settings.langs.clone()).run(&job)? else {
+    let Some(product) = Worker::new(settings.langs.clone()).run(&job)? else {
         return Ok(()); // user cancelled the region drag
+    };
+
+    // Screenshots are handled above, so anything reaching here is text.
+    let Product::Text(outcome) = product else {
+        return Ok(());
     };
 
     emit(&outcome, &cli)

@@ -28,7 +28,12 @@ iced = { version = "0.14.0", default-features = false, features = [
     "wayland",
     "x11",
     "tokio",
+    # Screenshot review needs the image widget. "image-without-codecs" rather
+    # than "image" so the image crate is not built with every decoder it ships;
+    # the direct dependency below turns on png alone.
+    "image-without-codecs",
 ] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # D-Bus, on tokio so it shares iced's runtime rather than dragging in async-io.
 zbus = { version = "5.18.0", default-features = false, features = ["tokio"] }
