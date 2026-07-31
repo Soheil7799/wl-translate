@@ -53,9 +53,16 @@ impl Tool {
         }
     }
 
-    /// Whether a stray click should be discarded rather than kept.
+    /// Whether this tool is defined by two corners, so a click with no drag
+    /// produced nothing worth keeping.
+    ///
+    /// Freehand tools are the exception: they accumulate every sample, so a
+    /// finished stroke has many points, not two. Leaving Highlight out of this
+    /// list meant every highlighter stroke failed the two-point check and was
+    /// thrown away on mouse-up - the tool drew a live preview and then silently
+    /// kept nothing.
     fn needs_a_drag(self) -> bool {
-        !matches!(self, Tool::Pen)
+        !matches!(self, Tool::Pen | Tool::Highlight)
     }
 }
 
@@ -376,6 +383,19 @@ mod tests {
 
         // The far corner was outside the region and must be untouched.
         assert_eq!(pixmap.pixels()[63].red(), before_outside.red());
+    }
+
+    #[test]
+    fn a_finished_freehand_stroke_survives_for_every_freehand_tool() {
+        for tool in [Tool::Pen, Tool::Highlight] {
+            let mut stroke = Annotation::new(tool, Point::new(0.0, 0.0), [1.0; 4], 3.0);
+
+            for step in 1..6 {
+                stroke.extend(Point::new(step as f64 * 10.0, step as f64 * 4.0));
+            }
+
+            assert!(stroke.is_usable(), "{tool:?} stroke was discarded");
+        }
     }
 
     #[test]
