@@ -13,7 +13,7 @@ mod capture;
 mod clip;
 mod ipc;
 mod ocr;
-mod overlay;
+mod geom;
 mod pipeline;
 mod settings;
 mod shot;

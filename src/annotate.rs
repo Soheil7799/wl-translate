@@ -4,20 +4,20 @@
 //! rasteriser that bakes them into the saved PNG. Rather than writing the
 //! shapes twice and watching the two drift apart, both draw from [`outline`],
 //! which reduces every tool to a list of polylines. The preview strokes them
-//! with iced paths; the output strokes them with tiny-skia.
+//! with the toolkit of the day; the output strokes them with tiny-skia.
 
-use iced::{Point, Vector};
+use crate::geom::{Point, Rect, Size};
 
 /// Segments used to approximate an ellipse. Enough that the curve reads as
 /// smooth at any size a screenshot annotation is likely to be.
 const ELLIPSE_STEPS: usize = 64;
 /// Length of an arrow head, as a fraction of the shaft.
-const HEAD_FRACTION: f32 = 0.22;
+const HEAD_FRACTION: f64 = 0.22;
 /// Longest an arrow head may get, in points, so a long arrow does not grow a
 /// comically large head.
-const HEAD_MAX: f32 = 34.0;
+const HEAD_MAX: f64 = 34.0;
 /// Half-angle of the arrow head, in radians (~28°).
-const HEAD_SPREAD: f32 = 0.48;
+const HEAD_SPREAD: f64 = 0.48;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -46,7 +46,7 @@ impl Tool {
     }
 
     /// Highlighter ink is translucent, and thick enough to cover a line of text.
-    pub fn ink(self, color: [f32; 4], width: f32) -> ([f32; 4], f32) {
+    pub fn ink(self, color: [f64; 4], width: f64) -> ([f64; 4], f64) {
         match self {
             Tool::Highlight => ([color[0], color[1], color[2], 0.35], width * 5.0),
             _ => (color, width),
@@ -65,12 +65,12 @@ pub struct Annotation {
     /// Pen keeps every sample; the other tools keep only start and end.
     pub points: Vec<Point>,
     /// Straight rgba, 0..1, so both renderers can take it unchanged.
-    pub color: [f32; 4],
-    pub width: f32,
+    pub color: [f64; 4],
+    pub width: f64,
 }
 
 impl Annotation {
-    pub fn new(tool: Tool, from: Point, color: [f32; 4], width: f32) -> Self {
+    pub fn new(tool: Tool, from: Point, color: [f64; 4], width: f64) -> Self {
         Self {
             tool,
             points: vec![from],
@@ -103,14 +103,14 @@ impl Annotation {
     }
 
     /// The rectangle a two-corner tool covers, in whatever space its points are.
-    pub fn bounds(&self) -> Option<iced::Rectangle> {
+    pub fn bounds(&self) -> Option<Rect> {
         let [a, b] = self.points.as_slice() else {
             return None;
         };
 
-        Some(iced::Rectangle::new(
+        Some(Rect::new(
             Point::new(a.x.min(b.x), a.y.min(b.y)),
-            iced::Size::new((a.x - b.x).abs(), (a.y - b.y).abs()),
+            Size::new((a.x - b.x).abs(), (a.y - b.y).abs()),
         ))
     }
 }
@@ -152,7 +152,7 @@ pub fn outline(annotation: &Annotation) -> Vec<Vec<Point>> {
 }
 
 /// Colours offered for annotations, in the order they appear and are numbered.
-pub const PALETTE: [(&str, [f32; 4]); 6] = [
+pub const PALETTE: [(&str, [f64; 4]); 6] = [
     ("red", [0.92, 0.19, 0.21, 1.0]),
     ("orange", [0.96, 0.55, 0.13, 1.0]),
     ("yellow", [0.98, 0.83, 0.20, 1.0]),
@@ -162,20 +162,20 @@ pub const PALETTE: [(&str, [f32; 4]); 6] = [
 ];
 
 /// Stroke widths, cycled with the thickness control.
-pub const WIDTHS: [f32; 4] = [2.0, 4.0, 7.0, 12.0];
+pub const WIDTHS: [f64; 4] = [2.0, 4.0, 7.0, 12.0];
 
 /// The two barbs, as one polyline that runs through the tip.
 fn arrow_head(from: Point, to: Point) -> Vec<Point> {
     let shaft = distance(from, to);
 
-    if shaft <= f32::EPSILON {
+    if shaft <= f64::EPSILON {
         return Vec::new();
     }
 
     let length = (shaft * HEAD_FRACTION).min(HEAD_MAX);
     let angle = (to.y - from.y).atan2(to.x - from.x);
 
-    let barb = |offset: f32| {
+    let barb = |offset: f64| {
         let direction = angle + offset;
         Point::new(
             to.x - length * direction.cos(),
@@ -189,20 +189,20 @@ fn arrow_head(from: Point, to: Point) -> Vec<Point> {
 /// An ellipse inscribed in the box defined by two opposite corners.
 fn ellipse(a: Point, b: Point) -> Vec<Point> {
     let centre = Point::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
-    let radius = Vector::new((a.x - b.x).abs() / 2.0, (a.y - b.y).abs() / 2.0);
+    let radius = Size::new((a.x - b.x).abs() / 2.0, (a.y - b.y).abs() / 2.0);
 
     (0..=ELLIPSE_STEPS)
         .map(|step| {
-            let angle = step as f32 / ELLIPSE_STEPS as f32 * std::f32::consts::TAU;
+            let angle = step as f64 / ELLIPSE_STEPS as f64 * std::f64::consts::TAU;
             Point::new(
-                centre.x + radius.x * angle.cos(),
-                centre.y + radius.y * angle.sin(),
+                centre.x + radius.width * angle.cos(),
+                centre.y + radius.height * angle.sin(),
             )
         })
         .collect()
 }
 
-fn distance(a: Point, b: Point) -> f32 {
+fn distance(a: Point, b: Point) -> f64 {
     ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt()
 }
 
@@ -215,7 +215,7 @@ pub fn rasterize(
     annotations: &[Annotation],
     png: &[u8],
     origin: Point,
-    scale: f32,
+    scale: f64,
 ) -> anyhow::Result<Vec<u8>> {
     use anyhow::Context;
     use tiny_skia::{LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
@@ -244,13 +244,14 @@ pub fn rasterize(
     for annotation in annotations.iter().filter(|a| a.tool != Tool::Blur) {
         let mut paint = Paint::default();
         let [red, green, blue, alpha] = annotation.color;
-        paint.set_color(tiny_skia::Color::from_rgba(red, green, blue, alpha).unwrap_or(
+        // tiny-skia works in f32; our geometry is f64, so cast at this boundary.
+        paint.set_color(tiny_skia::Color::from_rgba(red as f32, green as f32, blue as f32, alpha as f32).unwrap_or(
             tiny_skia::Color::from_rgba8(255, 0, 0, 255),
         ));
         paint.anti_alias = true;
 
         let stroke = Stroke {
-            width: (annotation.width * scale).max(1.0),
+            width: (annotation.width * scale).max(1.0) as f32,
             line_cap: LineCap::Round,
             line_join: LineJoin::Round,
             ..Stroke::default()
@@ -264,9 +265,9 @@ pub fn rasterize(
                 let y = (point.y - origin.y) * scale;
 
                 if index == 0 {
-                    builder.move_to(x, y);
+                    builder.move_to(x as f32, y as f32);
                 } else {
-                    builder.line_to(x, y);
+                    builder.line_to(x as f32, y as f32);
                 }
             }
 
@@ -285,11 +286,11 @@ pub fn rasterize(
 /// unlike a drawn-on black box there is nothing underneath to recover.
 fn pixelate(
     pixmap: &mut tiny_skia::Pixmap,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    block: f32,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    block: f64,
 ) {
     let (image_width, image_height) = (pixmap.width() as i64, pixmap.height() as i64);
 

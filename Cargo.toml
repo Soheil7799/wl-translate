@@ -16,33 +16,6 @@ serde_json = "1"
 ureq = { version = "2", features = ["json", "tls"] }
 leptess = "0.14"
 
-# UI. tiny-skia rather than wgpu: no GPU init, no device selection, which on a
-# hybrid-graphics laptop is one less thing that can go wrong.
-#
-# "wayland" and "x11" are not optional extras here. iced_tiny_skia takes
-# softbuffer with default-features off and re-exports the backends through its
-# own features, so without these softbuffer compiles with zero backends and
-# fails on an uninhabited enum.
-iced = { version = "0.14.0", default-features = false, features = [
-    # wgpu first, tiny-skia as the fallback. iced tries wgpu and falls back on
-    # its own, so a machine where the GPU path fails still runs.
-    #
-    # tiny-skia alone was fine for a small text popup but wrong for the
-    # selection overlay: that CPU-composites a full-screen image plus the
-    # dimming on every pointer event, which is what made dragging stutter.
-    "wgpu",
-    "tiny-skia",
-    "wayland",
-    "x11",
-    "tokio",
-    # Screenshot review needs the image widget. "image-without-codecs" rather
-    # than "image" so the image crate is not built with every decoder it ships;
-    # the direct dependency below turns on png alone.
-    "image-without-codecs",
-    # The selection overlay draws the frozen capture, the dimming and the
-    # selection box itself, and needs raw mouse events to do it.
-    "canvas",
-] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Already in the tree as iced's fallback renderer. Used directly to bake
@@ -54,6 +27,13 @@ tiny-skia = { version = "0.11", features = ["png-format"] }
 zbus = { version = "5.18.0", default-features = false, features = ["tokio"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 serde = { version = "1.0.229", features = ["derive"] }
+# GTK4 for the UI. Pango handles Persian and bidirectional text properly,
+# which is the entire reason this branch exists: iced renders Persian fine
+# but its text inputs mishandle the cursor and selection in right-to-left
+# text, and this app is for editing that text, not just looking at it.
+gtk = { version = "0.11", package = "gtk4", features = ["v4_12"] }
+glib = "0.21"
+async-channel = "2.5.0"
 
 [profile.release]
 opt-level = 3
