@@ -1,0 +1,6 @@
+/target
+/.worktrees
+
+# Machine-local build config: points every worktree at one shared target dir.
+# Absolute path, so it must not be committed - see README.
+/.cargo/config.toml
