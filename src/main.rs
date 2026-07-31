@@ -17,6 +17,8 @@ mod settings;
 mod translate;
 mod ui;
 
+use std::io::IsTerminal;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -45,7 +47,8 @@ struct Cli {
     #[arg(short, long, global = true)]
     copy: bool,
 
-    /// Show the result as a desktop notification
+    /// Force a desktop notification. Already automatic when stdout is not a
+    /// terminal, which is what a keybind is.
     #[arg(short, long, global = true)]
     notify: bool,
 
@@ -163,6 +166,10 @@ impl Cli {
 
 /// Print the result, and optionally copy/notify. Source text goes to stderr so
 /// `wl-translate ocr | some-tool` pipes only the translation.
+///
+/// Notifies automatically when stdout is not a terminal and the daemon did not
+/// take the job. That is exactly the keybind case: without it the work happens,
+/// prints into a terminal that does not exist, and the key looks broken.
 fn emit(outcome: &Outcome, cli: &Cli) -> Result<()> {
     eprintln!(
         "--- source ({}) ---\n{}\n--- translation ({}) ---",
@@ -173,7 +180,7 @@ fn emit(outcome: &Outcome, cli: &Cli) -> Result<()> {
     if cli.copy {
         clip::copy(&outcome.translation)?;
     }
-    if cli.notify {
+    if cli.notify || !std::io::stdout().is_terminal() {
         notify(outcome)?;
     }
     Ok(())
