@@ -99,6 +99,24 @@ struct Window {
 
 /// Run the daemon. Blocks until the process is interrupted.
 pub fn run(langs: Option<String>) -> Result<()> {
+    // Default to GTK's software renderer.
+    //
+    // GSK otherwise initialises Vulkan, and on this machine that pulls in the
+    // NVIDIA driver: 235MB resident and two dozen driver threads, for a daemon
+    // that spends almost all of its life showing nothing at all. Cairo does the
+    // same work here - blit a texture, stroke a few shapes - at 6MB on one
+    // thread.
+    //
+    // Overridable: setting GSK_RENDERER yourself leaves this alone, in case the
+    // overlay ever wants the GPU back.
+    //
+    // Safe: set before GTK is initialised, so nothing is reading it yet.
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        unsafe {
+            std::env::set_var("GSK_RENDERER", "cairo");
+        }
+    }
+
     let langs = langs.unwrap_or_else(|| Settings::load().langs);
     let _ = LANGS.set(langs.clone());
 
