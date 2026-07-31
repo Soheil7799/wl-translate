@@ -58,8 +58,13 @@ pub enum Message {
     Canvas(overlay::Action),
     /// Pick a drawing tool, or `None` to go back to selecting.
     PickTool(Option<Tool>),
+    PickColor([f32; 4]),
+    /// Step through the stroke widths.
+    CycleWidth,
     /// Drop the last annotation.
     Undo,
+    /// Put back the last undone annotation.
+    Redo,
     /// Esc: leave the current tool, or close if there is none.
     EscapeOverlay,
     PreviewOpened(window::Id),
@@ -131,6 +136,10 @@ struct Overlay {
     annotations: Vec<Annotation>,
     /// The stroke under the pointer right now.
     drawing: Option<Annotation>,
+    ink: [f32; 4],
+    width: f32,
+    /// Undone annotations, newest last, so Redo can put them back.
+    undone: Vec<Annotation>,
 }
 
 /// The canvas asks for this so a drag can report itself.
@@ -271,6 +280,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 tool: None,
                 annotations: Vec::new(),
                 drawing: None,
+                ink: annotate::PALETTE[0].1,
+                width: annotate::WIDTHS[1],
+                undone: Vec::new(),
             });
 
             show_overlay(state)
@@ -286,7 +298,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
                 overlay::Action::Begin(at) => {
                     if let Some(tool) = overlay.tool {
-                        overlay.drawing = Some(Annotation::new(tool, at, INK, PEN_WIDTH));
+                        let (ink, width) = tool.ink(overlay.ink, overlay.width);
+                        overlay.drawing = Some(Annotation::new(tool, at, ink, width));
                     }
                 }
 
@@ -302,6 +315,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     if let Some(drawing) = overlay.drawing.take() {
                         if drawing.is_usable() {
                             overlay.annotations.push(drawing);
+                            // Drawing something new abandons the redo trail,
+                            // the same as every other editor.
+                            overlay.undone.clear();
                         }
                     }
                 }
@@ -322,7 +338,38 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
         Message::Undo => {
             if let Some(overlay) = &mut state.overlay {
-                overlay.annotations.pop();
+                if let Some(annotation) = overlay.annotations.pop() {
+                    overlay.undone.push(annotation);
+                }
+            }
+            Task::none()
+        }
+
+        Message::Redo => {
+            if let Some(overlay) = &mut state.overlay {
+                if let Some(annotation) = overlay.undone.pop() {
+                    overlay.annotations.push(annotation);
+                }
+            }
+            Task::none()
+        }
+
+        Message::PickColor(ink) => {
+            if let Some(overlay) = &mut state.overlay {
+                overlay.ink = ink;
+            }
+            Task::none()
+        }
+
+        Message::CycleWidth => {
+            if let Some(overlay) = &mut state.overlay {
+                let next = annotate::WIDTHS
+                    .iter()
+                    .position(|width| (*width - overlay.width).abs() < 0.01)
+                    .map(|index| (index + 1) % annotate::WIDTHS.len())
+                    .unwrap_or(0);
+
+                overlay.width = annotate::WIDTHS[next];
             }
             Task::none()
         }
@@ -638,21 +685,15 @@ fn close_overlay(state: &mut State) -> Task<Message> {
 
 /// Height of the toolbar strip, used both to lay it out and to decide which
 /// screen edge it can sit on without covering the selection.
-const TOOLBAR: f32 = 116.0;
+const TOOLBAR: f32 = 72.0;
+/// Width of the tool strip, used the same way for the left/right choice.
+const SIDEBAR: f32 = 190.0;
 
-/// Annotation colour and stroke width. Red at three points is what every
-/// screenshot tool defaults to, and it reads on both light and dark captures.
-const INK: [f32; 4] = [0.92, 0.19, 0.21, 1.0];
-const PEN_WIDTH: f32 = 3.0;
-
-/// The action buttons, stuck to whichever screen edge the selection leaves
-/// clear. They do not follow the selection around - they only get out of its
-/// way.
-fn toolbar(overlay: &Overlay) -> Element<'_, Message> {
-    let screen = overlay
-        .screen
-        .unwrap_or(iced::Size::new(1920.0, 1080.0));
-
+/// The commit actions, stuck to whichever horizontal screen edge the selection
+/// leaves clear. They do not follow the selection around - they only get out of
+/// its way.
+fn action_bar(overlay: &Overlay) -> Element<'_, Message> {
+    let screen = overlay.screen.unwrap_or(iced::Size::new(1920.0, 1080.0));
     let anchor = overlay::toolbar_anchor(overlay.selection, screen, TOOLBAR);
 
     let actions = [
@@ -667,34 +708,103 @@ fn toolbar(overlay: &Overlay) -> Element<'_, Message> {
         strip.push(button(text(action.label()).size(12)).on_press(Message::Shot(action)))
     });
 
-    let tools = [Tool::Pen, Tool::Arrow, Tool::Rectangle, Tool::Ellipse]
-        .into_iter()
-        .fold(row![].spacing(8), |strip, tool| {
-            let chip = button(text(tool.label()).size(12)).on_press(Message::PickTool(Some(tool)));
-
-            strip.push(if overlay.tool == Some(tool) {
-                chip.style(button::primary)
-            } else {
-                chip.style(button::secondary)
-            })
-        })
-        .push(
-            button(text("Undo  (Ctrl+Z)").size(12))
-                .style(button::secondary)
-                .on_press(Message::Undo),
-        );
-
-    container(
-        column![tools, actions]
-            .spacing(8)
-            .align_x(Alignment::Center),
-    )
+    container(actions)
         .width(Length::Fill)
         .height(Length::Fill)
         .align_x(Alignment::Center)
         .align_y(match anchor {
             overlay::Anchor::Top => Alignment::Start,
             overlay::Anchor::Bottom => Alignment::End,
+        })
+        .padding(20)
+        .into()
+}
+
+/// Drawing tools, colours and thickness, on whichever vertical edge the
+/// selection leaves clear.
+fn tool_strip(overlay: &Overlay) -> Element<'_, Message> {
+    let screen = overlay.screen.unwrap_or(iced::Size::new(1920.0, 1080.0));
+    let side = overlay::sidebar_anchor(overlay.selection, screen, SIDEBAR);
+
+    let tools = [
+        Tool::Pen,
+        Tool::Arrow,
+        Tool::Rectangle,
+        Tool::Ellipse,
+        Tool::Highlight,
+        Tool::Blur,
+    ]
+    .into_iter()
+    .fold(column![].spacing(6), |stack, tool| {
+        let chip = button(text(tool.label()).size(12))
+            .width(Length::Fill)
+            .on_press(Message::PickTool(Some(tool)));
+
+        stack.push(if overlay.tool == Some(tool) {
+            chip.style(button::primary)
+        } else {
+            chip.style(button::secondary)
+        })
+    });
+
+    // Swatches are numbered, so the label doubles as its own shortcut.
+    let colors = annotate::PALETTE.iter().enumerate().fold(
+        row![].spacing(4),
+        |strip, (index, (_name, ink))| {
+            let ink = *ink;
+            let selected = overlay.ink == ink;
+
+            strip.push(
+                button(text(format!("{}", index + 1)).size(11))
+                    .width(30)
+                    .style(move |_theme, _status| button::Style {
+                        background: Some(iced::Color::from_rgba(ink[0], ink[1], ink[2], 1.0).into()),
+                        text_color: if ink[0] + ink[1] + ink[2] > 2.0 {
+                            iced::Color::BLACK
+                        } else {
+                            iced::Color::WHITE
+                        },
+                        border: iced::Border {
+                            width: if selected { 2.0 } else { 0.0 },
+                            color: iced::Color::WHITE,
+                            radius: 4.0.into(),
+                        },
+                        ..button::Style::default()
+                    })
+                    .on_press(Message::PickColor(ink)),
+            )
+        },
+    );
+
+    let history = row![
+        button(text("Undo").size(12))
+            .style(button::secondary)
+            .on_press(Message::Undo),
+        button(text("Redo").size(12))
+            .style(button::secondary)
+            .on_press(Message::Redo),
+    ]
+    .spacing(6);
+
+    let panel = column![
+        tools,
+        colors,
+        button(text(format!("Width {}  (w)", overlay.width as u32)).size(12))
+            .width(Length::Fill)
+            .style(button::secondary)
+            .on_press(Message::CycleWidth),
+        history,
+    ]
+    .spacing(8)
+    .width(SIDEBAR);
+
+    container(panel)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_y(Alignment::Center)
+        .align_x(match side {
+            overlay::Side::Left => Alignment::Start,
+            overlay::Side::Right => Alignment::End,
         })
         .padding(20)
         .into()
@@ -723,7 +833,8 @@ fn view(state: &State, window_id: window::Id) -> Element<'_, Message> {
                     .width(Length::Fill)
                     .height(Length::Fill),
                 )
-                .push(toolbar(overlay))
+                .push(action_bar(overlay))
+                .push(tool_strip(overlay))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into();
@@ -864,11 +975,25 @@ fn review_key(event: iced::keyboard::Event) -> Message {
         // drawing on.
         Key::Named(Named::Escape) => Message::EscapeOverlay,
         Key::Character(character) => match character.as_str() {
+            "z" if modifiers.control() && modifiers.shift() => Message::Redo,
             "z" if modifiers.control() => Message::Undo,
+            "y" if modifiers.control() => Message::Redo,
             "p" => Message::PickTool(Some(Tool::Pen)),
             "a" => Message::PickTool(Some(Tool::Arrow)),
             "r" => Message::PickTool(Some(Tool::Rectangle)),
             "o" => Message::PickTool(Some(Tool::Ellipse)),
+            "h" => Message::PickTool(Some(Tool::Highlight)),
+            "b" => Message::PickTool(Some(Tool::Blur)),
+            "w" => Message::CycleWidth,
+            // Swatches are numbered on screen, so the digits match what you see.
+            digit if digit.len() == 1 && digit.chars().all(|c| c.is_ascii_digit()) => {
+                match digit.parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= annotate::PALETTE.len() => {
+                        Message::PickColor(annotate::PALETTE[n - 1].1)
+                    }
+                    _ => Message::Ignore,
+                }
+            }
             // Ctrl+C as well as plain c, since one is muscle memory and the
             // other is what the button says.
             "c" => Message::Shot(Commit::Copy),

@@ -206,6 +206,26 @@ where
         // outside the selection still has to be visible while you draw it, even
         // though the crop will discard it.
         for annotation in self.annotations.iter().chain(self.drawing) {
+            // Blur has no outline - it edits pixels - so the preview stands in
+            // for it with a filled box. Pixelating live on every pointer move
+            // would cost far more than it tells you.
+            if annotation.tool == Tool::Blur {
+                if let Some(area) = annotation.bounds() {
+                    frame.fill_rectangle(
+                        area.position(),
+                        area.size(),
+                        Color::from_rgba(0.08, 0.08, 0.10, 0.85),
+                    );
+                    frame.stroke(
+                        &Path::rectangle(area.position(), area.size()),
+                        Stroke::default()
+                            .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.5))
+                            .with_width(1.0),
+                    );
+                }
+                continue;
+            }
+
             let [red, green, blue, alpha] = annotation.color;
             let stroke = Stroke::default()
                 .with_color(Color::from_rgba(red, green, blue, alpha))
@@ -419,6 +439,36 @@ pub fn toolbar_anchor(selection: Option<Selection>, screen: Size, bar: f32) -> A
         (_, 0.0) => Anchor::Top,
         (in_bottom, in_top) if in_top < in_bottom => Anchor::Top,
         _ => Anchor::Bottom,
+    }
+}
+
+/// Which vertical edge the tool strip sits against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+/// Pick the vertical screen edge the selection covers least.
+///
+/// Same rule as [`toolbar_anchor`], turned ninety degrees. Left is preferred
+/// because that is where tool palettes normally live.
+pub fn sidebar_anchor(selection: Option<Selection>, screen: Size, strip: f32) -> Side {
+    let Some(rect) = selection.map(|selection| selection.0) else {
+        return Side::Left;
+    };
+
+    let left = Rectangle::new(Point::ORIGIN, Size::new(strip, screen.height));
+    let right = Rectangle::new(
+        Point::new((screen.width - strip).max(0.0), 0.0),
+        Size::new(strip, screen.height),
+    );
+
+    match (overlap(rect, left), overlap(rect, right)) {
+        (0.0, _) => Side::Left,
+        (_, 0.0) => Side::Right,
+        (in_left, in_right) if in_right < in_left => Side::Right,
+        _ => Side::Left,
     }
 }
 

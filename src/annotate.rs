@@ -25,6 +25,12 @@ pub enum Tool {
     Arrow,
     Rectangle,
     Ellipse,
+    /// Freehand, but thick and translucent so the text underneath stays legible.
+    Highlight,
+    /// Pixelates its rectangle. The one tool that edits pixels rather than
+    /// drawing over them, because a drawn-on black box can be undone by anyone
+    /// with the file, and redaction that can be undone is not redaction.
+    Blur,
 }
 
 impl Tool {
@@ -34,7 +40,22 @@ impl Tool {
             Tool::Arrow => "Arrow  (a)",
             Tool::Rectangle => "Box  (r)",
             Tool::Ellipse => "Ellipse  (o)",
+            Tool::Highlight => "Highlight  (h)",
+            Tool::Blur => "Blur  (b)",
         }
+    }
+
+    /// Highlighter ink is translucent, and thick enough to cover a line of text.
+    pub fn ink(self, color: [f32; 4], width: f32) -> ([f32; 4], f32) {
+        match self {
+            Tool::Highlight => ([color[0], color[1], color[2], 0.35], width * 5.0),
+            _ => (color, width),
+        }
+    }
+
+    /// Whether a stray click should be discarded rather than kept.
+    fn needs_a_drag(self) -> bool {
+        !matches!(self, Tool::Pen)
     }
 }
 
@@ -64,7 +85,7 @@ impl Annotation {
     /// keeps replacing the second one as you drag.
     pub fn extend(&mut self, to: Point) {
         match self.tool {
-            Tool::Pen => self.points.push(to),
+            Tool::Pen | Tool::Highlight => self.points.push(to),
             _ => {
                 self.points.truncate(1);
                 self.points.push(to);
@@ -74,17 +95,33 @@ impl Annotation {
 
     /// Whether this is worth keeping, or just a click that drew nothing.
     pub fn is_usable(&self) -> bool {
-        match self.tool {
-            Tool::Pen => self.points.len() > 1,
-            _ => self.points.len() == 2 && distance(self.points[0], self.points[1]) > 3.0,
+        if self.tool.needs_a_drag() {
+            self.points.len() == 2 && distance(self.points[0], self.points[1]) > 3.0
+        } else {
+            self.points.len() > 1
         }
+    }
+
+    /// The rectangle a two-corner tool covers, in whatever space its points are.
+    pub fn bounds(&self) -> Option<iced::Rectangle> {
+        let [a, b] = self.points.as_slice() else {
+            return None;
+        };
+
+        Some(iced::Rectangle::new(
+            Point::new(a.x.min(b.x), a.y.min(b.y)),
+            iced::Size::new((a.x - b.x).abs(), (a.y - b.y).abs()),
+        ))
     }
 }
 
 /// Every polyline making up an annotation, in the same space its points are in.
 pub fn outline(annotation: &Annotation) -> Vec<Vec<Point>> {
     match annotation.tool {
-        Tool::Pen => vec![annotation.points.clone()],
+        // Blur has no outline: it replaces pixels rather than drawing on them.
+        Tool::Blur => Vec::new(),
+
+        Tool::Pen | Tool::Highlight => vec![annotation.points.clone()],
 
         Tool::Arrow => match annotation.points.as_slice() {
             [from, to] => vec![vec![*from, *to], arrow_head(*from, *to)],
@@ -113,6 +150,19 @@ pub fn outline(annotation: &Annotation) -> Vec<Vec<Point>> {
         },
     }
 }
+
+/// Colours offered for annotations, in the order they appear and are numbered.
+pub const PALETTE: [(&str, [f32; 4]); 6] = [
+    ("red", [0.92, 0.19, 0.21, 1.0]),
+    ("orange", [0.96, 0.55, 0.13, 1.0]),
+    ("yellow", [0.98, 0.83, 0.20, 1.0]),
+    ("green", [0.30, 0.76, 0.38, 1.0]),
+    ("blue", [0.26, 0.52, 0.96, 1.0]),
+    ("white", [1.0, 1.0, 1.0, 1.0]),
+];
+
+/// Stroke widths, cycled with the thickness control.
+pub const WIDTHS: [f32; 4] = [2.0, 4.0, 7.0, 12.0];
 
 /// The two barbs, as one polyline that runs through the tip.
 fn arrow_head(from: Point, to: Point) -> Vec<Point> {
@@ -176,7 +226,22 @@ pub fn rasterize(
 
     let mut pixmap = Pixmap::decode_png(png).context("could not decode the capture")?;
 
-    for annotation in annotations {
+    // Redaction first, so a box drawn to point at something is not itself
+    // pixelated by a later blur.
+    for annotation in annotations.iter().filter(|a| a.tool == Tool::Blur) {
+        if let Some(area) = annotation.bounds() {
+            pixelate(
+                &mut pixmap,
+                (area.x - origin.x) * scale,
+                (area.y - origin.y) * scale,
+                area.width * scale,
+                area.height * scale,
+                (annotation.width * scale * 2.5).max(6.0),
+            );
+        }
+    }
+
+    for annotation in annotations.iter().filter(|a| a.tool != Tool::Blur) {
         let mut paint = Paint::default();
         let [red, green, blue, alpha] = annotation.color;
         paint.set_color(tiny_skia::Color::from_rgba(red, green, blue, alpha).unwrap_or(
@@ -214,6 +279,72 @@ pub fn rasterize(
     pixmap.encode_png().context("could not encode the annotated capture")
 }
 
+/// Average square blocks of pixels in place.
+///
+/// Deliberately destructive: the original pixels are gone from the output, so
+/// unlike a drawn-on black box there is nothing underneath to recover.
+fn pixelate(
+    pixmap: &mut tiny_skia::Pixmap,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    block: f32,
+) {
+    let (image_width, image_height) = (pixmap.width() as i64, pixmap.height() as i64);
+
+    let left = (x.round() as i64).clamp(0, image_width);
+    let top = (y.round() as i64).clamp(0, image_height);
+    let right = ((x + width).round() as i64).clamp(0, image_width);
+    let bottom = ((y + height).round() as i64).clamp(0, image_height);
+
+    let block = (block.round() as i64).max(2);
+    let data = pixmap.data_mut();
+
+    let mut block_top = top;
+    while block_top < bottom {
+        let block_bottom = (block_top + block).min(bottom);
+
+        let mut block_left = left;
+        while block_left < right {
+            let block_right = (block_left + block).min(right);
+
+            let (mut red, mut green, mut blue, mut alpha, mut count) = (0u32, 0u32, 0u32, 0u32, 0u32);
+
+            for row in block_top..block_bottom {
+                for column in block_left..block_right {
+                    let index = ((row * image_width + column) * 4) as usize;
+                    red += data[index] as u32;
+                    green += data[index + 1] as u32;
+                    blue += data[index + 2] as u32;
+                    alpha += data[index + 3] as u32;
+                    count += 1;
+                }
+            }
+
+            if count > 0 {
+                let average = [
+                    (red / count) as u8,
+                    (green / count) as u8,
+                    (blue / count) as u8,
+                    (alpha / count) as u8,
+                ];
+
+                for row in block_top..block_bottom {
+                    for column in block_left..block_right {
+                        let index = ((row * image_width + column) * 4) as usize;
+                        data[index..index + 4].copy_from_slice(&average);
+                    }
+                }
+            }
+
+            block_left = block_right;
+        }
+
+        block_top = block_bottom;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +353,39 @@ mod tests {
         let mut annotation = Annotation::new(tool, from, [1.0, 0.0, 0.0, 1.0], 3.0);
         annotation.extend(to);
         annotation
+    }
+
+    #[test]
+    fn pixelating_flattens_a_region_and_leaves_the_rest_alone() {
+        use tiny_skia::{Pixmap, PremultipliedColorU8};
+
+        let mut pixmap = Pixmap::new(8, 8).unwrap();
+
+        // A gradient, so flattening is visible as neighbouring pixels agreeing.
+        for (index, pixel) in pixmap.pixels_mut().iter_mut().enumerate() {
+            let value = (index * 3) as u8;
+            *pixel = PremultipliedColorU8::from_rgba(value, value, value, 255).unwrap();
+        }
+
+        let before_outside = pixmap.pixels()[63];
+        pixelate(&mut pixmap, 0.0, 0.0, 4.0, 4.0, 4.0);
+
+        let flattened = &pixmap.pixels()[..4];
+        assert!(flattened.iter().all(|p| p.red() == flattened[0].red()));
+
+        // The far corner was outside the region and must be untouched.
+        assert_eq!(pixmap.pixels()[63].red(), before_outside.red());
+    }
+
+    #[test]
+    fn the_highlighter_is_translucent_and_fat() {
+        let (ink, width) = Tool::Highlight.ink([1.0, 0.0, 0.0, 1.0], 3.0);
+
+        assert!(ink[3] < 0.5, "highlighter must not hide what it marks");
+        assert!(width > 3.0);
+
+        // Every other tool leaves ink alone.
+        assert_eq!(Tool::Pen.ink([1.0, 0.0, 0.0, 1.0], 3.0), ([1.0, 0.0, 0.0, 1.0], 3.0));
     }
 
     #[test]
