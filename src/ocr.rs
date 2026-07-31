@@ -17,6 +17,16 @@ impl Ocr {
     /// `datapath` overrides where the models come from, which is how a better
     /// set than the distribution's can be used without touching system files.
     pub fn new(datapath: Option<&str>, langs: &str) -> Result<Self> {
+        // Tesseract is built against OpenMP and spawns a thread per core by
+        // default. For one screenshot-sized image that buys nothing measurable
+        // and costs a dozen threads plus their per-thread arenas, which is most
+        // of why this daemon looked so heavy after a single capture.
+        //
+        // Safe: set before any engine exists, so nothing is reading it.
+        unsafe {
+            std::env::set_var("OMP_THREAD_LIMIT", "1");
+        }
+
         let engine = LepTess::new(datapath, langs).with_context(|| {
             format!(
                 "tesseract init failed for '{langs}' - missing language data? \
