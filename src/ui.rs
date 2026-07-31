@@ -419,6 +419,34 @@ fn show_overlay(state: &mut State) -> Task<Message> {
         return Task::none();
     }
 
+    // Fullscreen is the app's own decision, not a compositor rule's: the
+    // overlay has to cover the output exactly or the selection stops lining up
+    // with the capture behind it, and that is too important to depend on a
+    // window rule being present and correct. The explicit size is a fallback
+    // for anything that ignores the fullscreen request.
+    //
+    // A `float` rule must NOT be added for this window: floating it makes
+    // Hyprland honour the toolkit's default 1024x768 instead, which is exactly
+    // how the overlay ended up small.
+    let size = state
+        .overlay
+        .as_ref()
+        .and_then(|overlay| {
+            shot::png_dimensions(&overlay.capture.png).map(|(width, height)| {
+                iced::Size::new(
+                    width as f32 / overlay.capture.scale,
+                    height as f32 / overlay.capture.scale,
+                )
+            })
+        })
+        .unwrap_or(iced::Size::new(1920.0, 1080.0));
+
+    // `fullscreen` ALONE. Pairing it with an explicit `size` made Hyprland treat
+    // this as an ordinary sized window and tile it at 924x1050, and a `float`
+    // rule made it fall back to the toolkit default of 1024x768. Both were
+    // tried; only the bare fullscreen request actually covers the output.
+    let _ = size;
+
     let (id, task) = window::open(window::Settings {
         fullscreen: true,
         decorations: false,

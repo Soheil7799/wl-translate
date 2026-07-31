@@ -123,10 +123,9 @@ fn main() -> Result<()> {
     if let Command::Shot { mode, no_save } = &cli.command {
         let mode: shot::Mode = mode.parse()?;
 
-        // With a daemon running the shot goes there, so it can be looked at
-        // before it is committed anywhere. Without one there is no window to
-        // review in, so it copies and saves straight away.
-        if !cli.no_daemon && ipc::forward(&Verb::Shot(mode))? {
+        // The overlay lives in the daemon, so start one if it is not up rather
+        // than quietly falling back to a different interaction model.
+        if !cli.no_daemon && ipc::forward_or_start(&Verb::Shot(mode))? {
             return Ok(());
         }
 

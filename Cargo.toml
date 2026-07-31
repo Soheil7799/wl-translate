@@ -24,6 +24,13 @@ leptess = "0.14"
 # own features, so without these softbuffer compiles with zero backends and
 # fails on an uninhabited enum.
 iced = { version = "0.14.0", default-features = false, features = [
+    # wgpu first, tiny-skia as the fallback. iced tries wgpu and falls back on
+    # its own, so a machine where the GPU path fails still runs.
+    #
+    # tiny-skia alone was fine for a small text popup but wrong for the
+    # selection overlay: that CPU-composites a full-screen image plus the
+    # dimming on every pointer event, which is what made dragging stutter.
+    "wgpu",
     "tiny-skia",
     "wayland",
     "x11",

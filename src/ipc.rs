@@ -85,6 +85,39 @@ pub trait Daemon {
     async fn show(&self) -> zbus::Result<()>;
 }
 
+/// Hand a verb to the daemon, starting one if there is none.
+///
+/// The daemon is meant to be resident - it is in the session autostart - so a
+/// missing one is a transient state, not a different mode of operation. Without
+/// this a keybind silently changes behaviour depending on whether a background
+/// process happens to be up, which is the sort of thing that looks like the
+/// keybind never got applied at all.
+pub fn forward_or_start(verb: &Verb) -> Result<bool> {
+    if forward(verb)? {
+        return Ok(true);
+    }
+
+    let exe = std::env::current_exe().context("could not find our own executable")?;
+
+    std::process::Command::new(exe)
+        .arg("daemon")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("could not start the daemon")?;
+
+    // Claiming the bus name takes a moment; poll rather than guess a delay.
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        if forward(verb)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 /// Hand a verb to a running daemon. `Ok(false)` means no daemon is running and
 /// the caller should do the work itself.
 pub fn forward(verb: &Verb) -> Result<bool> {
