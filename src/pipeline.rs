@@ -63,8 +63,9 @@ impl Job {
 #[derive(Debug, Clone)]
 pub enum Product {
     Text(Outcome),
-    /// PNG bytes, deliberately not yet saved or copied.
-    Shot(Vec<u8>),
+    /// A frozen output to pick a region out of, deliberately not yet cropped,
+    /// saved or copied.
+    Shot(shot::Capture),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -97,7 +98,7 @@ impl Worker {
     pub fn run(&mut self, job: &Job) -> Result<Option<Product>> {
         // Screenshots short-circuit the whole text pipeline.
         if let Verb::Shot(mode) = &job.verb {
-            return Ok(shot::capture(*mode, job.freeze)?.map(Product::Shot));
+            return Ok(Some(Product::Shot(shot::capture_for_overlay(*mode)?)));
         }
 
         let Some(source) = self.read_source(job)? else {

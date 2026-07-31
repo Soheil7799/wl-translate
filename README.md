@@ -56,9 +56,10 @@ wl-translate shot screen   # the focused output
 
 ## Screenshots
 
-The screen is held still while you drag, so a video or a scrolling page cannot
-move out from under the selection. What you capture is then shown for review and
-nothing is committed until you say so:
+The screen is captured up front and shown back to you fullscreen, so nothing is
+live any more: a video, a scrolling page or a hover tooltip cannot move out from
+under the selection. Drag a region on that frozen copy, adjust it by its corners
+or drag it around, and nothing is committed until you say so:
 
 | key | does |
 |---|---|

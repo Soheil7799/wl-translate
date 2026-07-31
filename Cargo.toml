@@ -32,6 +32,9 @@ iced = { version = "0.14.0", default-features = false, features = [
     # than "image" so the image crate is not built with every decoder it ships;
     # the direct dependency below turns on png alone.
     "image-without-codecs",
+    # The selection overlay draws the frozen capture, the dimming and the
+    # selection box itself, and needs raw mouse events to do it.
+    "canvas",
 ] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 

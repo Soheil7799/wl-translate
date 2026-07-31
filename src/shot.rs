@@ -51,6 +51,117 @@ pub struct Shot {
     pub saved: Option<PathBuf>,
 }
 
+/// A frozen output, ready to pick a region out of.
+#[derive(Debug, Clone)]
+pub struct Capture {
+    /// PNG of the whole focused output.
+    pub png: Vec<u8>,
+    /// Image pixels per logical point on that output.
+    pub scale: f32,
+    /// Where the selection should start, in image pixels. `None` means start
+    /// with nothing selected and let the drag define it.
+    pub preset: Option<(u32, u32, u32, u32)>,
+}
+
+/// Grab the focused output whole, plus wherever the selection should start.
+///
+/// Nothing is frozen with hyprpicker here: the capture *is* the freeze. From
+/// this point on the overlay shows a still image, so the selection can be
+/// adjusted for as long as you like without the screen moving underneath.
+pub fn capture_for_overlay(mode: Mode) -> Result<Capture> {
+    let monitor = focused_monitor()?;
+    let png = capture::grab_output_png(&monitor.name)?;
+    let scale = monitor.scale.max(0.1);
+
+    let preset = match mode {
+        Mode::Region => None,
+        Mode::Screen => {
+            let (width, height) = png_dimensions(&png).unwrap_or((0, 0));
+            (width > 0 && height > 0).then_some((0, 0, width, height))
+        }
+        Mode::Window => focused_window_in(&monitor).map(|(x, y, w, h)| {
+            (
+                (x as f32 * scale) as u32,
+                (y as f32 * scale) as u32,
+                (w as f32 * scale) as u32,
+                (h as f32 * scale) as u32,
+            )
+        }),
+    };
+
+    Ok(Capture { png, scale, preset })
+}
+
+/// Cut a region out of a captured PNG and re-encode it.
+pub fn crop(png: &[u8], x: u32, y: u32, width: u32, height: u32) -> Result<Vec<u8>> {
+    use std::io::Cursor;
+
+    let full = image::load_from_memory(png).context("could not decode the capture")?;
+    let cut = full.crop_imm(x, y, width, height);
+
+    let mut out = Vec::new();
+    cut.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+        .context("could not encode the cropped capture")?;
+
+    Ok(out)
+}
+
+/// Width and height read straight out of the PNG header - the IHDR fields sit
+/// at a fixed offset, so this is a read rather than a decode.
+pub fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
+    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+    if png.len() < 24 || &png[..8] != SIGNATURE || &png[12..16] != b"IHDR" {
+        return None;
+    }
+
+    Some((
+        u32::from_be_bytes(png[16..20].try_into().ok()?),
+        u32::from_be_bytes(png[20..24].try_into().ok()?),
+    ))
+}
+
+pub struct Monitor {
+    pub name: String,
+    pub scale: f32,
+    pub x: i64,
+    pub y: i64,
+}
+
+fn focused_monitor() -> Result<Monitor> {
+    let monitors: Value = hyprctl(&["monitors", "-j"])?;
+
+    let monitor = monitors
+        .as_array()
+        .context("hyprctl monitors: not a list")?
+        .iter()
+        .find(|monitor| monitor.get("focused").and_then(Value::as_bool) == Some(true))
+        .context("no focused output reported")?;
+
+    Ok(Monitor {
+        name: monitor
+            .get("name")
+            .and_then(Value::as_str)
+            .context("output has no name")?
+            .to_string(),
+        scale: monitor.get("scale").and_then(Value::as_f64).unwrap_or(1.0) as f32,
+        x: monitor.get("x").and_then(Value::as_i64).unwrap_or(0),
+        y: monitor.get("y").and_then(Value::as_i64).unwrap_or(0),
+    })
+}
+
+/// The focused window, in coordinates local to `monitor`.
+fn focused_window_in(monitor: &Monitor) -> Option<(i64, i64, i64, i64)> {
+    let active: Value = hyprctl(&["activewindow", "-j"]).ok()?;
+
+    let x = active.pointer("/at/0").and_then(Value::as_i64)?;
+    let y = active.pointer("/at/1").and_then(Value::as_i64)?;
+    let width = active.pointer("/size/0").and_then(Value::as_i64)?;
+    let height = active.pointer("/size/1").and_then(Value::as_i64)?;
+
+    (width > 0 && height > 0).then_some((x - monitor.x, y - monitor.y, width, height))
+}
+
 /// Take a screenshot. `Ok(None)` means the selection was cancelled.
 pub fn take(mode: Mode, freeze: bool, save: bool) -> Result<Option<Shot>> {
     let Some(png) = capture(mode, freeze)? else {
