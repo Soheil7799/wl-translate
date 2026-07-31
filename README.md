@@ -54,6 +54,45 @@ wl-translate text --to en "ciao"    # translate an argument
 
 Bound to a key there is no terminal to print to, so use `--notify --copy`.
 
+## Daemon
+
+```sh
+wl-translate daemon
+```
+
+Runs resident with the tesseract language models loaded, and shows results in a
+window instead of a notification. Every verb automatically hands its work to the
+daemon when one is running, so the same keybinds get faster and gain a UI with
+nothing to change. `--no-daemon` forces the work into the calling process.
+
+It also exposes the verbs on D-Bus, so a compositor can trigger it without this
+program's CLI in the loop at all:
+
+```sh
+busctl --user call org.wl_translate.Daemon /org/wl_translate/Daemon \
+       org.wl_translate.Daemon1 Selection s en
+```
+
+That call returns in ~8ms — a keybind never waits for OCR.
+
+Methods: `Ocr(s to)`, `OcrRaw(s to)`, `Selection(s to)`, `Clipboard(s to)`,
+`Text(s text, s to)`.
+
+The popup right-aligns right-to-left text and left-aligns everything else, per
+side, using the detected source language and the target language.
+
+### Window rule
+
+The popup has no `app_id` yet, so match it on title:
+
+```
+windowrulev2 = float, title:^wl-translate$
+windowrulev2 = size 720 440, title:^wl-translate$
+windowrulev2 = center, title:^wl-translate$
+```
+
+Without this the compositor tiles it like an ordinary window.
+
 ### Keybinds
 
 Hyprland:
@@ -116,9 +155,16 @@ scratch, which makes worktrees slower than switching branches.
 
 ## Status
 
-Working: `selection`, `clipboard`, `text`, `ocr`.
-Planned: resident daemon with preloaded tesseract, D-Bus verbs, and an iced GUI
-popup with editable source text and language pickers.
+Working: `selection`, `clipboard`, `text`, `ocr`, `daemon` with the D-Bus verbs
+and the popup.
+
+Known gaps:
+
+- The popup sets no Wayland `app_id`, so window rules have to match on title.
+- Source text is not editable yet, so OCR mistakes cannot be corrected in place.
+- No language picker in the window; the target language comes from the caller.
+- The D-Bus methods carry only a target language. Anything using `--from`,
+  `--engine` or `--geometry` runs in the calling process instead of the daemon.
 
 ## License
 

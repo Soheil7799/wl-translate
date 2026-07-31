@@ -16,6 +16,24 @@ serde_json = "1"
 ureq = { version = "2", features = ["json", "tls"] }
 leptess = "0.14"
 
+# UI. tiny-skia rather than wgpu: no GPU init, no device selection, which on a
+# hybrid-graphics laptop is one less thing that can go wrong.
+#
+# "wayland" and "x11" are not optional extras here. iced_tiny_skia takes
+# softbuffer with default-features off and re-exports the backends through its
+# own features, so without these softbuffer compiles with zero backends and
+# fails on an uninhabited enum.
+iced = { version = "0.14.0", default-features = false, features = [
+    "tiny-skia",
+    "wayland",
+    "x11",
+    "tokio",
+] }
+
+# D-Bus, on tokio so it shares iced's runtime rather than dragging in async-io.
+zbus = { version = "5.18.0", default-features = false, features = ["tokio"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"
