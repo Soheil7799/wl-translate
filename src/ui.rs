@@ -268,6 +268,13 @@ fn show(state: &mut State) -> Task<Message> {
     let (id, task) = window::open(window::Settings {
         size: iced::Size::new(760.0, 420.0),
         min_size: Some(iced::Size::new(420.0, 260.0)),
+        // This, not `iced::Settings::id`, is what becomes the Wayland app_id.
+        // Setting only the application-level id leaves the window with an empty
+        // class, and compositor rules have nothing to match on.
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: "wl-translate".to_string(),
+            ..Default::default()
+        },
         ..Default::default()
     });
 
