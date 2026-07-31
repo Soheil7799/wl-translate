@@ -1,622 +1,765 @@
-//! The selection overlay.
+//! The selection overlay, on GTK4.
 //!
-//! Flameshot's model: the screen is captured up front, that still image is
-//! shown fullscreen, and you pick your region on the frozen copy. Nothing can
-//! scroll or animate out from under the selection because nothing on screen is
-//! live any more - and the selection stays adjustable, because committing is a
-//! separate keypress rather than the mouse button coming up.
+//! Same model as before: the screen is captured up front and shown back
+//! fullscreen, so the selection is made on a still image and stays adjustable
+//! until a key or a button commits it.
 //!
-//! Coordinates are the fiddly part. The capture is in physical pixels; the
-//! canvas lays out in logical points. Everything here works in canvas points
-//! and converts once, at the edge, in [`Selection::to_pixels`].
+//! The layering is the lesson from the previous toolkit, restated. The frozen
+//! capture is a `Picture`, which GTK hands to the GPU as a texture; only the
+//! dimming, the selection and the annotations are drawn per frame, on a
+//! `DrawingArea` above it. Drawing the capture itself every frame is what made
+//! the first attempt stutter, and no amount of renderer choice fixes doing
+//! millions of pixels of work per pointer event.
+//!
+//! All the geometry lives in [`crate::geom`] and every shape in
+//! [`crate::annotate`], both toolkit-independent and tested, so this file is
+//! only widgets, input and Cairo.
 
-use crate::annotate::{Annotation, Tool};
-use iced::mouse;
-use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
-use iced::{Color, Point, Rectangle, Renderer, Size, Theme};
+use std::cell::RefCell;
+use std::rc::Rc;
 
-/// How close to a corner counts as grabbing it, in points.
-const HANDLE_GRAB: f32 = 18.0;
-/// Drawn size of a corner handle.
-const HANDLE_DRAW: f32 = 8.0;
-/// Selections smaller than this in either axis are treated as a stray click.
-const MIN_SELECTION: f32 = 4.0;
+use gtk::gdk;
+use gtk::glib;
+use gtk::prelude::*;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Selection(pub Rectangle);
+use crate::annotate::{self, Annotation, Tool};
+use crate::geom::{self, Point, Rect, Size};
+use crate::shot;
 
-impl Selection {
-    /// Convert a selection in canvas points to pixels in the captured image.
-    ///
-    /// `scale` is image pixels per canvas point, which is the output's scale
-    /// factor - 1.0 on an unscaled display, 2.0 on a HiDPI one.
-    pub fn to_pixels(self, scale: f32, image: Size<u32>) -> Option<(u32, u32, u32, u32)> {
-        let rect = self.0;
-
-        let x = (rect.x * scale).round().max(0.0) as u32;
-        let y = (rect.y * scale).round().max(0.0) as u32;
-        let width = (rect.width * scale).round() as u32;
-        let height = (rect.height * scale).round() as u32;
-
-        // Clamp into the image rather than trusting the pointer: a drag can end
-        // a pixel or two outside the surface.
-        let width = width.min(image.width.saturating_sub(x));
-        let height = height.min(image.height.saturating_sub(y));
-
-        (width > 0 && height > 0).then_some((x, y, width, height))
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Corner {
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Drag {
-    /// Dragging out a brand new selection from a fixed origin.
-    New { origin: Point },
-    /// Moving an existing selection; holds the grab offset inside it.
-    Move { offset: iced::Vector },
-    /// Resizing from one corner; the opposite corner stays put.
-    Resize { anchor: Point },
-}
-
-/// What the canvas reports back. Selecting and drawing are the same drag
-/// gesture in different modes, so they share one channel.
-#[derive(Debug, Clone)]
-pub enum Action {
-    Select(Selection),
-    /// Start a stroke at this point.
-    Begin(Point),
-    /// Continue the stroke in progress.
-    Extend(Point),
-    /// The stroke is done.
-    Finish,
-}
-
-#[derive(Default)]
-pub struct State {
+/// Everything the overlay is holding while it is open.
+struct State {
+    capture: shot::Capture,
+    screen: Size,
+    selection: Option<Rect>,
     drag: Option<Drag>,
-    drawing: bool,
+    tool: Option<Tool>,
+    annotations: Vec<Annotation>,
+    drawing: Option<Annotation>,
+    undone: Vec<Annotation>,
+    ink: [f64; 4],
+    width: f64,
+    /// Kept so the active indicator can be moved without rebuilding the strip.
+    tool_buttons: Vec<(Option<Tool>, gtk::Button)>,
+    swatches: Vec<gtk::DrawingArea>,
 }
 
-/// The canvas program. Rebuilt each frame from the app state, so the current
-/// selection is passed in rather than owned here.
-///
-/// It draws only the dimming and the selection. The frozen capture is an
-/// `image` widget stacked underneath, because geometry and images render in
-/// separate passes: an image drawn inside the canvas ends up on top of the
-/// dimming regardless of the order the calls were made in, which is exactly
-/// the bug that made the first overlay look undimmed.
-pub struct Selector<'a> {
-    pub selection: Option<Selection>,
-    /// `None` means the drag selects; anything else means it draws.
-    pub tool: Option<Tool>,
-    pub annotations: &'a [Annotation],
-    /// The stroke currently under the pointer, drawn but not yet committed.
-    pub drawing: Option<&'a Annotation>,
+#[derive(Clone, Copy)]
+enum Drag {
+    New { origin: Point },
+    Move { offset: (f64, f64) },
+    Resize { anchor: Point },
+    Draw,
 }
 
-impl<Message> canvas::Program<Message> for Selector<'_>
-where
-    Message: From<Action> + Clone,
-{
-    type State = State;
+/// What the overlay decided to do with the selection.
+pub enum Done {
+    /// Copied, saved, or both - nothing further to do.
+    Handled(String),
+    /// Recognise this image; `raw` skips translation.
+    Recognise { png: Vec<u8>, raw: bool },
+    Cancelled,
+}
 
-    fn update(
-        &self,
-        state: &mut Self::State,
-        event: &iced::Event,
-        bounds: Rectangle,
-        cursor: mouse::Cursor,
-    ) -> Option<canvas::Action<Message>> {
-        let position = cursor.position_in(bounds)?;
+/// Open the overlay for a capture. `finished` is called once, when it closes.
+pub fn present(
+    app: &gtk::Application,
+    capture: shot::Capture,
+    finished: impl Fn(Done) + 'static,
+) {
+    let screen = shot::png_dimensions(&capture.png)
+        .map(|(width, height)| {
+            Size::new(
+                width as f64 / capture.scale,
+                height as f64 / capture.scale,
+            )
+        })
+        .unwrap_or(Size::new(1920.0, 1080.0));
 
-        // With a tool picked, the same drag gesture draws instead of selecting.
-        if self.tool.is_some() {
-            return match event {
-                iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                    state.drawing = true;
-                    Some(canvas::Action::publish(Message::from(Action::Begin(position))).and_capture())
-                }
+    let selection = capture.preset.map(|(x, y, w, h)| {
+        let scale = capture.scale;
+        Rect::new(
+            Point::new(x as f64 / scale, y as f64 / scale),
+            Size::new(w as f64 / scale, h as f64 / scale),
+        )
+    });
 
-                iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.drawing => {
-                    Some(canvas::Action::publish(Message::from(Action::Extend(position))).and_capture())
-                }
+    let state = Rc::new(RefCell::new(State {
+        capture,
+        screen,
+        selection,
+        drag: None,
+        tool: None,
+        annotations: Vec::new(),
+        drawing: None,
+        undone: Vec::new(),
+        ink: annotate::PALETTE[0].1,
+        width: annotate::WIDTHS[1],
+        tool_buttons: Vec::new(),
+        swatches: Vec::new(),
+    }));
 
-                iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                    state.drawing = false;
-                    Some(canvas::Action::publish(Message::from(Action::Finish)).and_capture())
-                }
+    let window = gtk::ApplicationWindow::builder()
+        .application(app)
+        .decorated(false)
+        .title("wl-translate overlay")
+        .build();
 
-                _ => None,
-            };
+    window.fullscreen();
+
+    let picture = {
+        let png = state.borrow().capture.png.clone();
+        let texture = gdk::Texture::from_bytes(&glib::Bytes::from_owned(png)).ok();
+
+        let picture = gtk::Picture::new();
+        picture.set_paintable(texture.as_ref());
+        // Fill, not Contain: the window is the output and the capture is that
+        // output, so any letterboxing would mean the selection no longer lines
+        // up with what is underneath it.
+        picture.set_content_fit(gtk::ContentFit::Fill);
+        picture
+    };
+
+    let canvas = gtk::DrawingArea::new();
+    canvas.set_hexpand(true);
+    canvas.set_vexpand(true);
+
+    {
+        let state = state.clone();
+        canvas.set_draw_func(move |_area, cr, width, height| {
+            draw(&state.borrow(), cr, width as f64, height as f64);
+        });
+    }
+
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&picture));
+    overlay.add_overlay(&canvas);
+
+    let finished = Rc::new(finished);
+    let tools = tool_column(&state, &canvas);
+    let actions = action_bar(&window, &state, &finished);
+
+    overlay.add_overlay(&tools);
+    overlay.add_overlay(&actions);
+
+    window.set_child(Some(&overlay));
+
+    wire_pointer(&canvas, &state);
+    wire_keys(&window, &state, &canvas, &finished);
+
+    window.present();
+}
+
+// ── drawing ────────────────────────────────────────────────────────────────
+
+fn draw(state: &State, cr: &gtk::cairo::Context, width: f64, height: f64) {
+    let full = Rect::new(Point::ORIGIN, Size::new(width, height));
+
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.55);
+
+    match state.selection {
+        // Dim around the selection: Cairo has no hole-punch either, and four
+        // rectangles is cheaper than compositing a mask.
+        Some(rect) => {
+            for around in geom::surround(full, rect) {
+                cr.rectangle(around.x, around.y, around.width, around.height);
+            }
+            let _ = cr.fill();
+
+            cr.set_source_rgb(0.45, 0.55, 1.0);
+            cr.set_line_width(2.0);
+            cr.rectangle(rect.x, rect.y, rect.width, rect.height);
+            let _ = cr.stroke();
+
+            for corner in geom::corners(rect) {
+                cr.rectangle(
+                    corner.x - geom::HANDLE_DRAW / 2.0,
+                    corner.y - geom::HANDLE_DRAW / 2.0,
+                    geom::HANDLE_DRAW,
+                    geom::HANDLE_DRAW,
+                );
+            }
+            let _ = cr.fill();
         }
-
-        match event {
-            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                state.drag = Some(self.grab(position));
-                Some(canvas::Action::request_redraw().and_capture())
-            }
-
-            iced::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                let drag = state.drag?;
-                let selection = self.apply(drag, position, bounds);
-
-                Some(canvas::Action::publish(Message::from(Action::Select(selection))).and_capture())
-            }
-
-            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                state.drag = None;
-                Some(canvas::Action::request_redraw().and_capture())
-            }
-
-            _ => None,
+        None => {
+            cr.rectangle(0.0, 0.0, width, height);
+            let _ = cr.fill();
         }
     }
 
-    fn draw(
-        &self,
-        _state: &Self::State,
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<Geometry<Renderer>> {
-        let mut frame = Frame::new(renderer, bounds.size());
-        let full = Rectangle::new(Point::ORIGIN, bounds.size());
-
-        let dim = Color::from_rgba(0.0, 0.0, 0.0, 0.55);
-
-        match self.selection.map(|selection| selection.0) {
-            // Dim around the selection rather than over it: a frame has no way
-            // to punch a hole, and four rectangles is cheaper than compositing.
-            Some(rect) => {
-                for around in surround(full, rect) {
-                    frame.fill_rectangle(around.position(), around.size(), dim);
-                }
-
-                frame.stroke(
-                    &Path::rectangle(rect.position(), rect.size()),
-                    Stroke::default()
-                        .with_color(Color::from_rgb(0.45, 0.55, 1.0))
-                        .with_width(2.0),
-                );
-
-                for corner in corners(rect) {
-                    frame.fill_rectangle(
-                        Point::new(corner.x - HANDLE_DRAW / 2.0, corner.y - HANDLE_DRAW / 2.0),
-                        Size::new(HANDLE_DRAW, HANDLE_DRAW),
-                        Color::from_rgb(0.45, 0.55, 1.0),
-                    );
-                }
+    for annotation in state.annotations.iter().chain(state.drawing.as_ref()) {
+        // Blur edits pixels rather than drawing, so the preview stands in for
+        // it with a filled box; pixelating per pointer move would cost far more
+        // than it tells you.
+        if annotation.tool == Tool::Blur {
+            if let Some(area) = annotation.bounds() {
+                cr.set_source_rgba(0.08, 0.08, 0.10, 0.85);
+                cr.rectangle(area.x, area.y, area.width, area.height);
+                let _ = cr.fill();
             }
-            None => frame.fill_rectangle(full.position(), full.size(), dim),
+            continue;
         }
 
-        // No hint line here any more: the toolbar spells out every action and
-        // its key, and the two disagreed with each other as soon as the buttons
-        // gained their own shortcuts.
+        let [red, green, blue, alpha] = annotation.color;
+        cr.set_source_rgba(red, green, blue, alpha);
+        cr.set_line_width(annotation.width);
+        cr.set_line_cap(gtk::cairo::LineCap::Round);
+        cr.set_line_join(gtk::cairo::LineJoin::Round);
 
-        // Annotations last, so they sit above the dimming: something drawn just
-        // outside the selection still has to be visible while you draw it, even
-        // though the crop will discard it.
-        for annotation in self.annotations.iter().chain(self.drawing) {
-            // Blur has no outline - it edits pixels - so the preview stands in
-            // for it with a filled box. Pixelating live on every pointer move
-            // would cost far more than it tells you.
-            if annotation.tool == Tool::Blur {
-                if let Some(area) = annotation.bounds() {
-                    frame.fill_rectangle(
-                        area.position(),
-                        area.size(),
-                        Color::from_rgba(0.08, 0.08, 0.10, 0.85),
-                    );
-                    frame.stroke(
-                        &Path::rectangle(area.position(), area.size()),
-                        Stroke::default()
-                            .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.5))
-                            .with_width(1.0),
-                    );
+        for line in annotate::outline(annotation) {
+            for (index, point) in line.iter().enumerate() {
+                if index == 0 {
+                    cr.move_to(point.x, point.y);
+                } else {
+                    cr.line_to(point.x, point.y);
                 }
-                continue;
+            }
+            let _ = cr.stroke();
+        }
+    }
+}
+
+// ── input ──────────────────────────────────────────────────────────────────
+
+fn wire_pointer(canvas: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
+    let drag = gtk::GestureDrag::new();
+
+    {
+        let state = state.clone();
+        let canvas = canvas.clone();
+
+        drag.connect_drag_begin(move |_gesture, x, y| {
+            let at = Point::new(x, y);
+            let mut state = state.borrow_mut();
+
+            if let Some(tool) = state.tool {
+                let (ink, width) = tool.ink(state.ink, state.width);
+                state.drawing = Some(Annotation::new(tool, at, ink, width));
+                state.drag = Some(Drag::Draw);
+            } else {
+                state.drag = Some(match state.selection {
+                    Some(rect) => match geom::nearest_corner(rect, at) {
+                        Some(corner) => Drag::Resize {
+                            anchor: geom::opposite(rect, corner),
+                        },
+                        None if rect.contains(at) => Drag::Move {
+                            offset: (at.x - rect.x, at.y - rect.y),
+                        },
+                        None => Drag::New { origin: at },
+                    },
+                    None => Drag::New { origin: at },
+                });
             }
 
-            let [red, green, blue, alpha] = annotation.color;
-            let stroke = Stroke::default()
-                .with_color(Color::from_rgba(red, green, blue, alpha))
-                .with_width(annotation.width);
+            canvas.queue_draw();
+        });
+    }
 
-            for line in crate::annotate::outline(annotation) {
-                let mut path = iced::widget::canvas::path::Builder::new();
+    {
+        let state = state.clone();
+        let canvas = canvas.clone();
 
-                for (index, point) in line.iter().enumerate() {
-                    if index == 0 {
-                        path.move_to(*point);
-                    } else {
-                        path.line_to(*point);
+        drag.connect_drag_update(move |gesture, dx, dy| {
+            let Some((start_x, start_y)) = gesture.start_point() else {
+                return;
+            };
+
+            let at = Point::new(start_x + dx, start_y + dy);
+            let mut state = state.borrow_mut();
+
+            match state.drag {
+                Some(Drag::Draw) => {
+                    if let Some(drawing) = &mut state.drawing {
+                        drawing.extend(at);
                     }
                 }
+                Some(Drag::New { origin }) => {
+                    state.selection = Some(geom::from_corners(origin, at));
+                }
+                Some(Drag::Resize { anchor }) => {
+                    state.selection = Some(geom::from_corners(anchor, at));
+                }
+                Some(Drag::Move { offset }) => {
+                    if let Some(rect) = state.selection {
+                        let limit = state.screen;
+                        let x = (at.x - offset.0).clamp(0.0, (limit.width - rect.width).max(0.0));
+                        let y = (at.y - offset.1).clamp(0.0, (limit.height - rect.height).max(0.0));
 
-                frame.stroke(&path.build(), stroke.clone());
+                        state.selection =
+                            Some(Rect::new(Point::new(x, y), Size::new(rect.width, rect.height)));
+                    }
+                }
+                None => {}
+            }
+
+            canvas.queue_draw();
+        });
+    }
+
+    {
+        let state = state.clone();
+        let canvas = canvas.clone();
+
+        drag.connect_drag_end(move |_gesture, _dx, _dy| {
+            let mut state = state.borrow_mut();
+
+            // A click that drew nothing is dropped, rather than left as an
+            // invisible entry that Undo would appear to ignore.
+            if let Some(drawing) = state.drawing.take() {
+                if drawing.is_usable() {
+                    state.annotations.push(drawing);
+                    state.undone.clear();
+                }
+            }
+
+            state.drag = None;
+            canvas.queue_draw();
+        });
+    }
+
+    canvas.add_controller(drag);
+
+    // The pointer should say what a drag here would do, before you commit to
+    // it: a crosshair to draw a region, a four-way arrow to move one, and the
+    // matching diagonal to resize from a corner.
+    let motion = gtk::EventControllerMotion::new();
+
+    {
+        let state = state.clone();
+        let canvas = canvas.clone();
+
+        motion.connect_motion(move |_controller, x, y| {
+            let at = Point::new(x, y);
+            let state = state.borrow();
+
+            let name = if state.tool.is_some() {
+                "crosshair"
+            } else {
+                match state.selection {
+                    Some(rect) => match geom::nearest_corner(rect, at) {
+                        Some(geom::Corner::TopLeft) | Some(geom::Corner::BottomRight) => {
+                            "nwse-resize"
+                        }
+                        Some(geom::Corner::TopRight) | Some(geom::Corner::BottomLeft) => {
+                            "nesw-resize"
+                        }
+                        None if rect.contains(at) => "move",
+                        None => "crosshair",
+                    },
+                    None => "crosshair",
+                }
+            };
+
+            canvas.set_cursor_from_name(Some(name));
+        });
+    }
+
+    canvas.add_controller(motion);
+}
+
+fn wire_keys(
+    window: &gtk::ApplicationWindow,
+    state: &Rc<RefCell<State>>,
+    canvas: &gtk::DrawingArea,
+    finished: &Rc<impl Fn(Done) + 'static>,
+) {
+    let keys = gtk::EventControllerKey::new();
+
+    let state = state.clone();
+    let canvas = canvas.clone();
+    let finished = finished.clone();
+    // Cloned for the closure; the original is still needed below to attach the
+    // controller to.
+    let owner = window.clone();
+
+    keys.connect_key_pressed(move |_controller, key, _code, modifiers| {
+        let control = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
+        let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
+
+        let commit = |what: Commit| {
+            let done = commit(&state.borrow(), what);
+            owner.close();
+            finished(done);
+        };
+
+        match key {
+            gdk::Key::Return | gdk::Key::space => commit(Commit::Save),
+            gdk::Key::Escape => {
+                // Esc leaves the tool first, so it can never throw away a
+                // capture you were still drawing on.
+                let holding = state.borrow().tool.is_some();
+
+                if holding {
+                    set_tool(&state, &canvas, None);
+                } else {
+                    owner.close();
+                    finished(Done::Cancelled);
+                }
+            }
+            gdk::Key::c if control => commit(Commit::Copy),
+            gdk::Key::c => commit(Commit::Copy),
+            gdk::Key::s => commit(Commit::Save),
+            gdk::Key::e => commit(Commit::Extract),
+            gdk::Key::t => commit(Commit::Translate),
+            gdk::Key::z if control && shift => {
+                let mut state = state.borrow_mut();
+                if let Some(annotation) = state.undone.pop() {
+                    state.annotations.push(annotation);
+                }
+                canvas.queue_draw();
+            }
+            gdk::Key::z if control => {
+                let mut state = state.borrow_mut();
+                if let Some(annotation) = state.annotations.pop() {
+                    state.undone.push(annotation);
+                }
+                canvas.queue_draw();
+            }
+            gdk::Key::v => set_tool(&state, &canvas, None),
+            gdk::Key::p => set_tool(&state, &canvas, Some(Tool::Pen)),
+            gdk::Key::a => set_tool(&state, &canvas, Some(Tool::Arrow)),
+            gdk::Key::r => set_tool(&state, &canvas, Some(Tool::Rectangle)),
+            gdk::Key::o => set_tool(&state, &canvas, Some(Tool::Ellipse)),
+            gdk::Key::h => set_tool(&state, &canvas, Some(Tool::Highlight)),
+            gdk::Key::b => set_tool(&state, &canvas, Some(Tool::Blur)),
+            gdk::Key::w => {
+                let mut state = state.borrow_mut();
+                let next = annotate::WIDTHS
+                    .iter()
+                    .position(|w| (*w - state.width).abs() < 0.01)
+                    .map(|index| (index + 1) % annotate::WIDTHS.len())
+                    .unwrap_or(0);
+                state.width = annotate::WIDTHS[next];
+            }
+            _ => {
+                // Digits pick a colour; the swatches are numbered to match.
+                if let Some(digit) = key.to_unicode().and_then(|c| c.to_digit(10)) {
+                    let index = digit as usize;
+
+                    if index >= 1 && index <= annotate::PALETTE.len() {
+                        state.borrow_mut().ink = annotate::PALETTE[index - 1].1;
+                        pick_colour(&state);
+                    }
+                }
+                return glib::Propagation::Proceed;
             }
         }
 
-        vec![frame.into_geometry()]
+        glib::Propagation::Stop
+    });
+
+    window.add_controller(keys);
+}
+
+/// Choose a tool. `None` is the select/move tool, which is a tool like any
+/// other rather than the absence of one.
+///
+/// Deliberately sets rather than toggles: clicking the tool you are already
+/// holding used to switch you back to selecting, which meant a stray second
+/// click silently changed what the next drag would do. Going back to selecting
+/// is now its own button, so the mode is always something you chose.
+fn set_tool(state: &Rc<RefCell<State>>, canvas: &gtk::DrawingArea, tool: Option<Tool>) {
+    {
+        let mut state = state.borrow_mut();
+        state.tool = tool;
+        state.drawing = None;
     }
 
-    fn mouse_interaction(
-        &self,
-        _state: &Self::State,
-        bounds: Rectangle,
-        cursor: mouse::Cursor,
-    ) -> mouse::Interaction {
-        let Some(position) = cursor.position_in(bounds) else {
-            return mouse::Interaction::default();
-        };
+    refresh_tools(state);
+    canvas.queue_draw();
+}
 
-        // While a tool is active every drag draws, so the resize and move
-        // affordances would be lying.
-        if self.tool.is_some() {
-            return mouse::Interaction::Crosshair;
+/// Re-mark which tool button is active. Tools and colours have separate
+/// indicators on purpose: they are independent choices, and sharing one made
+/// picking a colour look like it had changed the tool.
+fn refresh_tools(state: &Rc<RefCell<State>>) {
+    let current = state.borrow().tool;
+
+    for (tool, button) in state.borrow().tool_buttons.iter() {
+        if *tool == current {
+            button.add_css_class("suggested-action");
+        } else {
+            button.remove_css_class("suggested-action");
         }
-
-        let Some(rect) = self.selection.map(|selection| selection.0) else {
-            return mouse::Interaction::Crosshair;
-        };
-
-        if let Some(corner) = nearest_corner(rect, position) {
-            return resize_cursor(corner);
-        }
-
-        if rect.contains(position) {
-            return mouse::Interaction::Move;
-        }
-
-        mouse::Interaction::Crosshair
     }
 }
 
-impl Selector<'_> {
-    /// Decide what a press at `position` starts: resizing from a corner,
-    /// moving the whole selection, or drawing a new one.
-    fn grab(&self, position: Point) -> Drag {
-        let Some(rect) = self.selection.map(|selection| selection.0) else {
-            return Drag::New { origin: position };
-        };
+// ── committing ─────────────────────────────────────────────────────────────
 
-        if let Some(corner) = nearest_corner(rect, position) {
-            return Drag::Resize {
-                anchor: opposite(rect, corner),
-            };
-        }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Commit {
+    Copy,
+    Save,
+    Extract,
+    Translate,
+}
 
-        if rect.contains(position) {
-            return Drag::Move {
-                offset: position - rect.position(),
-            };
-        }
-
-        Drag::New { origin: position }
+fn commit(state: &State, what: Commit) -> Done {
+    if !geom::is_usable(state.selection) {
+        return Done::Cancelled;
     }
 
-    fn apply(&self, drag: Drag, position: Point, bounds: Rectangle) -> Selection {
-        let limit = Size::new(bounds.width, bounds.height);
+    let image = shot::png_dimensions(&state.capture.png).unwrap_or((0, 0));
 
-        match drag {
-            Drag::New { origin } => Selection(from_corners(origin, position)),
-            Drag::Resize { anchor } => Selection(from_corners(anchor, position)),
-            Drag::Move { offset } => {
-                let rect = self.selection.map(|selection| selection.0).unwrap_or_default();
+    let Some(region) = state
+        .selection
+        .and_then(|rect| geom::to_pixels(rect, state.capture.scale, image))
+    else {
+        return Done::Cancelled;
+    };
 
-                // Keep a moved selection on screen; a dragged-off selection
-                // would crop to nothing.
-                let x = (position.x - offset.x).clamp(0.0, (limit.width - rect.width).max(0.0));
-                let y = (position.y - offset.y).clamp(0.0, (limit.height - rect.height).max(0.0));
+    let cropped = match shot::crop(&state.capture.png, region.0, region.1, region.2, region.3) {
+        Ok(cropped) => cropped,
+        Err(error) => return Done::Handled(format!("{error:#}")),
+    };
 
-                Selection(Rectangle::new(Point::new(x, y), rect.size()))
+    // Annotations are recorded in screen points; the crop starts at the
+    // selection's corner, so shifting by that and scaling lands them where they
+    // were drawn.
+    let origin = state
+        .selection
+        .map(|rect| rect.position())
+        .unwrap_or(Point::ORIGIN);
+
+    let cropped = match annotate::rasterize(
+        &state.annotations,
+        &cropped,
+        origin,
+        state.capture.scale,
+    ) {
+        Ok(annotated) => annotated,
+        Err(error) => return Done::Handled(format!("{error:#}")),
+    };
+
+    match what {
+        Commit::Copy => match shot::copy_image(&cropped) {
+            Ok(()) => Done::Handled("copied".into()),
+            Err(error) => Done::Handled(format!("{error:#}")),
+        },
+        Commit::Save => {
+            let _ = shot::copy_image(&cropped);
+
+            match shot::save(&cropped) {
+                Ok(path) => Done::Handled(format!("saved {}", path.display())),
+                Err(error) => Done::Handled(format!("{error:#}")),
             }
         }
+        Commit::Extract => Done::Recognise {
+            png: cropped,
+            raw: true,
+        },
+        Commit::Translate => Done::Recognise {
+            png: cropped,
+            raw: false,
+        },
     }
 }
 
-/// A rectangle from two opposite corners, in any order.
-fn from_corners(a: Point, b: Point) -> Rectangle {
-    Rectangle::new(
-        Point::new(a.x.min(b.x), a.y.min(b.y)),
-        Size::new((a.x - b.x).abs(), (a.y - b.y).abs()),
-    )
-}
+// ── toolbars ───────────────────────────────────────────────────────────────
 
-fn corners(rect: Rectangle) -> [Point; 4] {
-    [
-        Point::new(rect.x, rect.y),
-        Point::new(rect.x + rect.width, rect.y),
-        Point::new(rect.x, rect.y + rect.height),
-        Point::new(rect.x + rect.width, rect.y + rect.height),
-    ]
-}
+/// Tools and colours, side by side: one narrow column of icon buttons, and the
+/// swatches in their own column next to it. Icons rather than words because the
+/// text labels were wider than the thing they described.
+fn tool_column(state: &Rc<RefCell<State>>, canvas: &gtk::DrawingArea) -> gtk::Widget {
+    let tools = gtk::Box::new(gtk::Orientation::Vertical, 4);
 
-fn nearest_corner(rect: Rectangle, position: Point) -> Option<Corner> {
-    let all = [
-        (Corner::TopLeft, Point::new(rect.x, rect.y)),
-        (Corner::TopRight, Point::new(rect.x + rect.width, rect.y)),
-        (Corner::BottomLeft, Point::new(rect.x, rect.y + rect.height)),
+    for (tool, icon, tip) in [
+        (None, "find-location-symbolic", "Select and move  (v)"),
+        (Some(Tool::Pen), "document-edit-symbolic", Tool::Pen.label()),
+        (Some(Tool::Arrow), "go-next-symbolic", Tool::Arrow.label()),
         (
-            Corner::BottomRight,
-            Point::new(rect.x + rect.width, rect.y + rect.height),
+            Some(Tool::Rectangle),
+            "view-grid-symbolic",
+            Tool::Rectangle.label(),
         ),
-    ];
-
-    all.into_iter()
-        .find(|(_, corner)| {
-            (corner.x - position.x).abs() <= HANDLE_GRAB
-                && (corner.y - position.y).abs() <= HANDLE_GRAB
-        })
-        .map(|(corner, _)| corner)
-}
-
-/// The cursor for dragging a given corner.
-///
-/// A corner resizes along the diagonal it sits on, so the arrow has to point
-/// that way. Top-left and bottom-right share the ↖↘ axis; top-right and
-/// bottom-left share ↗↙. A grab hand says "you can pick this up and move it",
-/// which is what dragging the middle does, not what dragging a corner does.
-fn resize_cursor(corner: Corner) -> mouse::Interaction {
-    match corner {
-        Corner::TopLeft | Corner::BottomRight => mouse::Interaction::ResizingDiagonallyDown,
-        Corner::TopRight | Corner::BottomLeft => mouse::Interaction::ResizingDiagonallyUp,
-    }
-}
-
-fn opposite(rect: Rectangle, corner: Corner) -> Point {
-    match corner {
-        Corner::TopLeft => Point::new(rect.x + rect.width, rect.y + rect.height),
-        Corner::TopRight => Point::new(rect.x, rect.y + rect.height),
-        Corner::BottomLeft => Point::new(rect.x + rect.width, rect.y),
-        Corner::BottomRight => Point::new(rect.x, rect.y),
-    }
-}
-
-/// The four rectangles covering `full` except for `hole`.
-fn surround(full: Rectangle, hole: Rectangle) -> Vec<Rectangle> {
-    let bottom = hole.y + hole.height;
-    let right = hole.x + hole.width;
-
-    [
-        Rectangle::new(full.position(), Size::new(full.width, hole.y.max(0.0))),
-        Rectangle::new(
-            Point::new(full.x, bottom),
-            Size::new(full.width, (full.height - bottom).max(0.0)),
+        (
+            Some(Tool::Ellipse),
+            "media-record-symbolic",
+            Tool::Ellipse.label(),
         ),
-        Rectangle::new(
-            Point::new(full.x, hole.y),
-            Size::new(hole.x.max(0.0), hole.height),
+        (
+            Some(Tool::Highlight),
+            "format-text-underline-symbolic",
+            Tool::Highlight.label(),
         ),
-        Rectangle::new(
-            Point::new(right, hole.y),
-            Size::new((full.width - right).max(0.0), hole.height),
+        (Some(Tool::Blur), "view-conceal-symbolic", Tool::Blur.label()),
+    ] {
+        let button = gtk::Button::from_icon_name(icon);
+        button.set_tooltip_text(Some(tip));
+        button.add_css_class("flat");
+
+        {
+            let state = state.clone();
+            let canvas = canvas.clone();
+            button.connect_clicked(move |_| set_tool(&state, &canvas, tool));
+        }
+
+        state.borrow_mut().tool_buttons.push((tool, button.clone()));
+        tools.append(&button);
+    }
+
+    refresh_tools(state);
+
+    let undo = gtk::Button::from_icon_name("edit-undo-symbolic");
+    undo.add_css_class("flat");
+    undo.set_tooltip_text(Some("Undo  (Ctrl+Z)"));
+    {
+        let state = state.clone();
+        let canvas = canvas.clone();
+        undo.connect_clicked(move |_| {
+            let mut state = state.borrow_mut();
+            if let Some(annotation) = state.annotations.pop() {
+                state.undone.push(annotation);
+            }
+            canvas.queue_draw();
+        });
+    }
+    tools.append(&undo);
+
+    let redo = gtk::Button::from_icon_name("edit-redo-symbolic");
+    redo.add_css_class("flat");
+    redo.set_tooltip_text(Some("Redo  (Ctrl+Shift+Z)"));
+    {
+        let state = state.clone();
+        let canvas = canvas.clone();
+        redo.connect_clicked(move |_| {
+            let mut state = state.borrow_mut();
+            if let Some(annotation) = state.undone.pop() {
+                state.annotations.push(annotation);
+            }
+            canvas.queue_draw();
+        });
+    }
+    tools.append(&redo);
+
+    // Colours get a column of their own, beside the tools rather than under
+    // them, so neither list makes the other taller.
+    let colors = gtk::Box::new(gtk::Orientation::Vertical, 4);
+
+    for (index, (name, ink)) in annotate::PALETTE.iter().enumerate() {
+        let swatch = gtk::Button::new();
+        swatch.set_tooltip_text(Some(&format!("{name}  ({})", index + 1)));
+        swatch.set_size_request(28, 28);
+        swatch.add_css_class("flat");
+        swatch.add_css_class("circular");
+
+        let dot = gtk::DrawingArea::new();
+        dot.set_size_request(16, 16);
+
+        let ink = *ink;
+
+        {
+            // The selected colour is marked by a ring around its own swatch,
+            // not by the button styling the tools use - otherwise picking a
+            // colour looks like it changed which tool is active.
+            let state = state.clone();
+
+            dot.set_draw_func(move |_area, cr, width, height| {
+                let centre = (width as f64 / 2.0, height as f64 / 2.0);
+                let radius = (width.min(height) as f64) / 2.0 - 2.0;
+
+                cr.set_source_rgba(ink[0], ink[1], ink[2], 1.0);
+                cr.arc(centre.0, centre.1, radius, 0.0, std::f64::consts::TAU);
+                let _ = cr.fill();
+
+                if state.borrow().ink == ink {
+                    cr.set_source_rgb(1.0, 1.0, 1.0);
+                    cr.set_line_width(2.0);
+                    cr.arc(centre.0, centre.1, radius + 1.0, 0.0, std::f64::consts::TAU);
+                    let _ = cr.stroke();
+                }
+            });
+        }
+
+        swatch.set_child(Some(&dot));
+        state.borrow_mut().swatches.push(dot.clone());
+
+        {
+            let state = state.clone();
+            swatch.connect_clicked(move |_| {
+                state.borrow_mut().ink = ink;
+                pick_colour(&state);
+            });
+        }
+
+        colors.append(&swatch);
+    }
+
+    tools.set_valign(gtk::Align::Center);
+    colors.set_valign(gtk::Align::Center);
+
+    let strip = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    strip.append(&tools);
+    strip.append(&colors);
+    strip.set_halign(gtk::Align::Start);
+    strip.set_valign(gtk::Align::Center);
+    strip.set_margin_start(16);
+
+    // `osd` and `toolbar` are GTK's own style classes, so the strip picks up
+    // whatever the system theme says an overlay toolbar looks like - including
+    // light/dark - instead of carrying colours of its own.
+    strip.add_css_class("osd");
+    strip.add_css_class("toolbar");
+    strip.set_margin_top(8);
+    strip.set_margin_bottom(8);
+
+    strip.upcast()
+}
+
+/// Redraw every swatch so the ring follows the choice.
+fn pick_colour(state: &Rc<RefCell<State>>) {
+    for swatch in state.borrow().swatches.iter() {
+        swatch.queue_draw();
+    }
+}
+
+fn action_bar(
+    window: &gtk::ApplicationWindow,
+    state: &Rc<RefCell<State>>,
+    finished: &Rc<impl Fn(Done) + 'static>,
+) -> gtk::Widget {
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+
+    for (what, icon, tip) in [
+        (Some(Commit::Copy), "edit-copy-symbolic", "Copy  (c)"),
+        (Some(Commit::Save), "document-save-symbolic", "Save  (Enter)"),
+        (
+            Some(Commit::Extract),
+            "insert-text-symbolic",
+            "Extract text  (e)",
         ),
-    ]
-    .into_iter()
-    .filter(|rect| rect.width > 0.0 && rect.height > 0.0)
-    .collect()
-}
+        (
+            Some(Commit::Translate),
+            "accessories-dictionary-symbolic",
+            "Translate text  (t)",
+        ),
+        (None, "window-close-symbolic", "Close  (Esc)"),
+    ] {
+        let button = gtk::Button::from_icon_name(icon);
+        button.set_tooltip_text(Some(tip));
+        button.add_css_class("flat");
 
-/// Which screen edge the toolbar sits against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Anchor {
-    Top,
-    Bottom,
-}
+        let state = state.clone();
+        let window = window.clone();
+        let finished = finished.clone();
 
-/// Pick the screen edge that the selection covers least.
-///
-/// The toolbar sticks to the *screen*, not to the selection - it does not
-/// follow the box around. All it does is move out of the way, so it never sits
-/// on top of what you are trying to look at.
-///
-/// Bottom is preferred because that is where the hint line already is; it flips
-/// to the top only when the selection reaches into the bottom strip. A
-/// selection tall enough to cover both gets whichever it overlaps less.
-pub fn toolbar_anchor(selection: Option<Selection>, screen: Size, bar: f32) -> Anchor {
-    let Some(rect) = selection.map(|selection| selection.0) else {
-        return Anchor::Bottom;
-    };
+        button.connect_clicked(move |_| {
+            let done = match what {
+                Some(what) => commit(&state.borrow(), what),
+                None => Done::Cancelled,
+            };
 
-    let top = Rectangle::new(Point::ORIGIN, Size::new(screen.width, bar));
-    let bottom = Rectangle::new(
-        Point::new(0.0, (screen.height - bar).max(0.0)),
-        Size::new(screen.width, bar),
-    );
+            window.close();
+            finished(done);
+        });
 
-    match (overlap(rect, bottom), overlap(rect, top)) {
-        (0.0, _) => Anchor::Bottom,
-        (_, 0.0) => Anchor::Top,
-        (in_bottom, in_top) if in_top < in_bottom => Anchor::Top,
-        _ => Anchor::Bottom,
-    }
-}
-
-/// Which vertical edge the tool strip sits against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    Left,
-    Right,
-}
-
-/// Pick the vertical screen edge the selection covers least.
-///
-/// Same rule as [`toolbar_anchor`], turned ninety degrees. Left is preferred
-/// because that is where tool palettes normally live.
-pub fn sidebar_anchor(selection: Option<Selection>, screen: Size, strip: f32) -> Side {
-    let Some(rect) = selection.map(|selection| selection.0) else {
-        return Side::Left;
-    };
-
-    let left = Rectangle::new(Point::ORIGIN, Size::new(strip, screen.height));
-    let right = Rectangle::new(
-        Point::new((screen.width - strip).max(0.0), 0.0),
-        Size::new(strip, screen.height),
-    );
-
-    match (overlap(rect, left), overlap(rect, right)) {
-        (0.0, _) => Side::Left,
-        (_, 0.0) => Side::Right,
-        (in_left, in_right) if in_right < in_left => Side::Right,
-        _ => Side::Left,
-    }
-}
-
-/// Area shared by two rectangles.
-fn overlap(a: Rectangle, b: Rectangle) -> f32 {
-    let width = (a.x + a.width).min(b.x + b.width) - a.x.max(b.x);
-    let height = (a.y + a.height).min(b.y + b.height) - a.y.max(b.y);
-
-    if width <= 0.0 || height <= 0.0 {
-        0.0
-    } else {
-        width * height
-    }
-}
-
-/// Whether a selection is big enough to be a deliberate drag rather than a
-/// stray click.
-pub fn is_usable(selection: Option<Selection>) -> bool {
-    selection.is_some_and(|selection| {
-        selection.0.width >= MIN_SELECTION && selection.0.height >= MIN_SELECTION
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_rectangle_comes_out_the_same_whichever_corner_you_drag_from() {
-        let downhill = from_corners(Point::new(10.0, 10.0), Point::new(40.0, 50.0));
-        let uphill = from_corners(Point::new(40.0, 50.0), Point::new(10.0, 10.0));
-
-        assert_eq!(downhill, uphill);
-        assert_eq!(downhill.width, 30.0);
-        assert_eq!(downhill.height, 40.0);
+        bar.append(&button);
     }
 
-    #[test]
-    fn dimming_covers_everything_except_the_selection() {
-        let full = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
-        let hole = Rectangle::new(Point::new(20.0, 30.0), Size::new(40.0, 20.0));
+    bar.set_halign(gtk::Align::Center);
+    bar.set_valign(gtk::Align::End);
+    bar.set_margin_bottom(24);
+    bar.add_css_class("osd");
+    bar.add_css_class("toolbar");
 
-        let covered: f32 = surround(full, hole).iter().map(|r| r.width * r.height).sum();
-
-        assert_eq!(covered, 100.0 * 100.0 - 40.0 * 20.0);
-    }
-
-    #[test]
-    fn a_selection_flush_with_an_edge_produces_no_zero_sized_dimming() {
-        let full = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
-        let hole = Rectangle::new(Point::ORIGIN, Size::new(100.0, 40.0));
-
-        assert!(surround(full, hole).iter().all(|r| r.width > 0.0 && r.height > 0.0));
-    }
-
-    #[test]
-    fn scaling_to_pixels_respects_the_output_scale() {
-        let selection = Selection(Rectangle::new(Point::new(10.0, 20.0), Size::new(30.0, 40.0)));
-
-        let (x, y, w, h) = selection
-            .to_pixels(2.0, Size::new(1000, 1000))
-            .expect("non-empty");
-
-        assert_eq!((x, y, w, h), (20, 40, 60, 80));
-    }
-
-    #[test]
-    fn a_selection_running_past_the_edge_is_clamped_into_the_image() {
-        let selection = Selection(Rectangle::new(Point::new(90.0, 0.0), Size::new(40.0, 10.0)));
-
-        let (x, _, w, _) = selection
-            .to_pixels(1.0, Size::new(100, 100))
-            .expect("non-empty");
-
-        assert_eq!((x, w), (90, 10));
-    }
-
-    const SCREEN: Size = Size {
-        width: 1920.0,
-        height: 1080.0,
-    };
-    const BAR: f32 = 60.0;
-
-    fn at(x: f32, y: f32, w: f32, h: f32) -> Option<Selection> {
-        Some(Selection(Rectangle::new(
-            Point::new(x, y),
-            Size::new(w, h),
-        )))
-    }
-
-    #[test]
-    fn the_toolbar_sits_at_the_bottom_when_nothing_is_in_the_way() {
-        assert_eq!(toolbar_anchor(None, SCREEN, BAR), Anchor::Bottom);
-        assert_eq!(
-            toolbar_anchor(at(100.0, 100.0, 400.0, 300.0), SCREEN, BAR),
-            Anchor::Bottom
-        );
-    }
-
-    #[test]
-    fn it_moves_to_the_top_when_the_selection_reaches_the_bottom() {
-        assert_eq!(
-            toolbar_anchor(at(100.0, 900.0, 400.0, 180.0), SCREEN, BAR),
-            Anchor::Top
-        );
-    }
-
-    #[test]
-    fn a_selection_covering_both_edges_takes_the_one_it_covers_least() {
-        // Full height, but only clipping a sliver of the top strip.
-        let selection = at(0.0, 40.0, 400.0, 1040.0);
-
-        assert_eq!(toolbar_anchor(selection, SCREEN, BAR), Anchor::Top);
-    }
-
-    #[test]
-    fn each_corner_points_along_the_diagonal_it_resizes() {
-        assert_eq!(
-            resize_cursor(Corner::TopLeft),
-            mouse::Interaction::ResizingDiagonallyDown
-        );
-        assert_eq!(
-            resize_cursor(Corner::BottomRight),
-            mouse::Interaction::ResizingDiagonallyDown
-        );
-        assert_eq!(
-            resize_cursor(Corner::TopRight),
-            mouse::Interaction::ResizingDiagonallyUp
-        );
-        assert_eq!(
-            resize_cursor(Corner::BottomLeft),
-            mouse::Interaction::ResizingDiagonallyUp
-        );
-    }
-
-    #[test]
-    fn corners_are_found_within_the_grab_radius_and_not_beyond_it() {
-        let rect = Rectangle::new(Point::new(100.0, 100.0), Size::new(200.0, 200.0));
-
-        assert!(nearest_corner(rect, Point::new(104.0, 104.0)).is_some());
-        assert!(nearest_corner(rect, Point::new(200.0, 200.0)).is_none());
-    }
-
-    #[test]
-    fn a_stray_click_is_not_a_usable_selection() {
-        let click = Selection(Rectangle::new(Point::ORIGIN, Size::new(1.0, 1.0)));
-
-        assert!(!is_usable(Some(click)));
-        assert!(!is_usable(None));
-    }
+    bar.upcast()
 }

@@ -1,1089 +1,541 @@
-//! The resident daemon and its window.
+//! The resident daemon and its translator window, on GTK4.
 //!
-//! Built on `iced::daemon` rather than `iced::application` because that is
-//! exactly this shape: a process that runs silently with no window and opens
-//! one only when something triggers it.
+//! Why GTK: this window exists to *edit* text, often Persian. Pango implements
+//! the Unicode bidirectional algorithm and Arabic shaping properly, including
+//! caret movement and selection through mixed right-to-left and left-to-right
+//! runs. That last part is what the previous toolkit got wrong - it rendered
+//! Persian correctly but could not put the caret in the right place inside it,
+//! which makes an editor useless for the language it is most needed for.
 //!
-//! Threading:
+//! Threading is unchanged from before; only the destination differs:
 //!
-//!   D-Bus method ──► trigger channel ─┐
-//!                                     ├─► subscription ──► update
-//!   worker thread ──► outcome channel ┘                      │
-//!         ▲                                                  │
-//!         └──────────────── job channel ─────────────────────┘
+//!   D-Bus (tokio thread) ──┐
+//!                          ├──► async channel ──► GTK main loop
+//!   worker thread ─────────┘
 //!
-//! The worker thread owns the OCR engine for the life of the process, so the
-//! language models load once instead of on every capture. It also means
-//! `LepTess` never crosses a thread boundary, so it never needs to be `Send`.
+//! The worker still owns the OCR engine for the process lifetime, so tesseract
+//! loads once and `LepTess` never crosses a thread boundary.
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use iced::futures::{SinkExt, Stream};
-use iced::widget::{button, column, container, image, row, rule, text, text_editor};
-use iced::{window, Alignment, Element, Length, Subscription, Task, Theme};
-use tokio::sync::mpsc::{self, UnboundedSender};
+use anyhow::{Context, Result};
+use gtk::prelude::*;
+use gtk::{gio, glib};
 
-use crate::clip;
 use crate::ipc;
 use crate::pipeline::{Job, Outcome, Product, Verb, Worker};
-use crate::annotate::{self, Annotation, Tool};
-use crate::overlay::{self, Selection};
-use crate::shot;
 use crate::settings::Settings;
 
-/// Tesseract languages for the daemon's OCR engine. A `Subscription` is built
-/// from a plain function pointer, which cannot capture, so the configured value
-/// is parked here at startup.
 static LANGS: OnceLock<String> = OnceLock::new();
 
-/// How long to wait after the last keystroke before re-translating. Long enough
-/// not to fire on every character, short enough to feel immediate.
-const SETTLE: Duration = Duration::from_millis(350);
-
-#[derive(Debug, Clone)]
-pub enum Message {
-    /// The worker is up; this is how to send it jobs.
-    Ready(UnboundedSender<Job>),
-    Trigger(Verb),
+/// Anything the background threads need the UI to know about.
+enum Event {
     Finished(Outcome),
     Failed(String),
-    Opened(window::Id),
-    /// The window went away by some route other than our Close button. Without
-    /// this the stored id outlives the window and we never open another.
-    Closed(window::Id),
-    /// A frozen output came back; the overlay picks a region out of it.
-    Captured(shot::Capture),
-    /// Something happened on the overlay canvas: a selection drag, or a stroke.
-    Canvas(overlay::Action),
-    /// Pick a drawing tool, or `None` to go back to selecting.
-    PickTool(Option<Tool>),
-    PickColor([f32; 4]),
-    /// Step through the stroke widths.
-    CycleWidth,
-    /// Drop the last annotation.
-    Undo,
-    /// Put back the last undone annotation.
-    Redo,
-    /// Esc: leave the current tool, or close if there is none.
-    EscapeOverlay,
-    PreviewOpened(window::Id),
-    /// What to do with the selected region. Each has a button and a key.
-    Shot(Commit),
-    SourceEdit(text_editor::Action),
-    TargetEdit(text_editor::Action),
-    PickSource(String),
-    PickTarget(String),
-    Swap,
-    Copy,
-    Dismiss,
-    /// Debounce tick; carries the edit generation it was scheduled for.
-    Settle(u64),
-    Ignore,
+    /// A frozen output to pick a region out of.
+    Captured(crate::shot::Capture),
 }
 
-pub struct State {
-    settings: Settings,
-    source: text_editor::Content,
-    target: text_editor::Content,
-    jobs: Option<UnboundedSender<Job>>,
-    window: Option<window::Id>,
-    /// What the engine detected, shown when the source side is on "auto".
-    detected: Option<String>,
-    status: Option<String>,
+/// How long to wait after the last keystroke before re-translating.
+const SETTLE: Duration = Duration::from_millis(350);
+
+/// Widgets the update path needs to reach back into.
+struct Window {
+    window: gtk::ApplicationWindow,
+    source: gtk::TextView,
+    target: gtk::TextView,
+    status: gtk::Label,
+    source_chips: gtk::Box,
+    target_chips: gtk::Box,
+    swap_button: gtk::Button,
+    settings: RefCell<Settings>,
+    jobs: std::sync::mpsc::Sender<Job>,
     /// Bumped on every edit so a stale debounce tick can be ignored.
-    generation: u64,
-    /// Set by "extract text", so the recognised text lands on the clipboard as
-    /// well as in the window.
-    copy_when_done: bool,
-    /// A frozen output awaiting a selection and a decision.
-    overlay: Option<Overlay>,
-    overlay_window: Option<window::Id>,
-}
-
-/// What the overlay can do with the region you selected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Commit {
-    Copy,
-    Save,
-    Extract,
-    Translate,
-    Close,
-}
-
-impl Commit {
-    /// Label and the key that also triggers it.
-    fn label(self) -> &'static str {
-        match self {
-            Commit::Copy => "Copy  (c)",
-            Commit::Save => "Save  (Enter)",
-            Commit::Extract => "Extract text  (e)",
-            Commit::Translate => "Translate text  (t)",
-            Commit::Close => "Close  (Esc)",
-        }
-    }
-}
-
-/// A frozen output on screen, with whatever is selected out of it.
-struct Overlay {
-    capture: shot::Capture,
-    handle: image::Handle,
-    selection: Option<Selection>,
-    /// Output size in logical points, for deciding where the toolbar goes.
-    screen: Option<iced::Size>,
-    /// `None` means drags select; anything else means they draw.
-    tool: Option<Tool>,
-    annotations: Vec<Annotation>,
-    /// The stroke under the pointer right now.
-    drawing: Option<Annotation>,
-    ink: [f32; 4],
-    width: f32,
-    /// Undone annotations, newest last, so Redo can put them back.
-    undone: Vec<Annotation>,
-}
-
-/// The canvas asks for this so a drag can report itself.
-impl From<overlay::Action> for Message {
-    fn from(action: overlay::Action) -> Self {
-        Message::Canvas(action)
-    }
-}
-
-impl State {
-    fn new() -> Self {
-        Self {
-            settings: Settings::load(),
-            source: text_editor::Content::new(),
-            target: text_editor::Content::new(),
-            jobs: None,
-            window: None,
-            detected: None,
-            status: None,
-            generation: 0,
-            copy_when_done: false,
-            overlay: None,
-            overlay_window: None,
-        }
-    }
+    generation: Cell<u64>,
+    /// Set while the code fills the buffers, because `connect_changed` cannot
+    /// tell our writes from the user's - without this, showing a translation
+    /// would look like an edit and translate itself again, forever.
+    quiet: Cell<bool>,
 }
 
 /// Run the daemon. Blocks until the process is interrupted.
-pub fn run(langs: Option<String>) -> anyhow::Result<()> {
+pub fn run(langs: Option<String>) -> Result<()> {
     let langs = langs.unwrap_or_else(|| Settings::load().langs);
-    let _ = LANGS.set(langs);
+    let _ = LANGS.set(langs.clone());
 
-    iced::daemon(
-        || (State::new(), Task::none()),
-        update,
-        view as fn(&State, window::Id) -> Element<Message>,
-    )
-    // The id becomes the Wayland app_id, which is what compositor rules match.
-    .settings(iced::Settings {
-        id: Some("wl-translate".to_string()),
-        ..Default::default()
-    })
-    // Distinct titles so compositor rules can size the review window
-    // differently from the translation window; they share a class.
-    .title(|state: &State, id| {
-        if state.overlay_window == Some(id) {
-            "wl-translate overlay".to_string()
-        } else {
-            "wl-translate".to_string()
-        }
-    })
-    .theme(|_state: &State, _id| Theme::Dark)
-    .subscription(subscription)
-    .run()
-    .map_err(|e| anyhow::anyhow!("iced daemon failed: {e}"))
-}
+    let app = gtk::Application::builder()
+        .application_id("org.wl_translate.Gtk")
+        // NOT IS_SERVICE: that defers activation until something calls the
+        // app over its own D-Bus name, so  never fired and the
+        // window and its channel readers were never created. Our D-Bus is
+        // served separately by zbus, so plain flags are what we want.
+        .flags(gio::ApplicationFlags::empty())
+        .build();
 
-fn update(state: &mut State, message: Message) -> Task<Message> {
-    match message {
-        Message::Ready(sender) => {
-            state.jobs = Some(sender);
-            Task::none()
-        }
+    // Jobs go to the worker; verbs and results come back over async channels,
+    // which are the only thing the GTK main loop is able to await.
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
+    let (event_tx, event_rx) = async_channel::unbounded::<Event>();
+    let (trigger_tx, trigger_rx) = async_channel::unbounded::<Verb>();
 
-        Message::Trigger(Verb::Show) => show(state),
+    spawn_worker(langs, job_rx, event_tx.clone());
+    spawn_dbus(trigger_tx, event_tx)?;
 
-        // Deliberately does NOT open the window.
-        //
-        // For OCR the very next thing that happens is slurp taking over the
-        // screen for a region drag, and a window appearing first is both a
-        // distraction and a focus thief. For the other verbs the result is
-        // ~150ms away, so waiting means the window appears already filled in
-        // rather than blank. Either way the window belongs to the result, not
-        // to the request.
-        Message::Trigger(verb) => {
-            if state.window.is_some() {
-                state.status = Some("working...".into());
-            }
-            dispatch(state, verb)
-        }
+    app.connect_activate(move |app| {
+        // Keeps the application alive with no window on screen, which is what
+        // makes this a daemon rather than an app that quits when you close it.
+        let hold = app.hold();
 
-        Message::Finished(outcome) => {
-            if std::mem::take(&mut state.copy_when_done) {
-                let _ = clip::copy(outcome.translation.trim());
-                state.status = Some("copied".into());
-            } else {
-                state.status = None;
-            }
+        let window = Rc::new(build_window(app, job_tx.clone()));
+        wire(&window);
+        rebuild_chips(&window);
 
-            state.source = text_editor::Content::with_text(&outcome.source);
-            state.target = text_editor::Content::with_text(&outcome.translation);
-            state.detected = Some(outcome.from);
-            show(state)
-        }
+        {
+            let window = window.clone();
+            let events = event_rx.clone();
+            let app = app.clone();
 
-        Message::Failed(error) => {
-            state.status = Some(error);
-            show(state)
-        }
+            glib::spawn_future_local(async move {
+                while let Ok(event) = events.recv().await {
+                    match event {
+                        Event::Finished(outcome) => window.show_outcome(&outcome),
+                        Event::Failed(error) => window.show_error(&error),
 
-        Message::Opened(id) => {
-            state.window = Some(id);
-            Task::none()
-        }
+                        Event::Captured(capture) => {
+                            let window = window.clone();
 
-        Message::Closed(id) => {
-            if state.window == Some(id) {
-                state.window = None;
-            }
-            if state.overlay_window == Some(id) {
-                state.overlay_window = None;
-                state.overlay = None;
-            }
-            Task::none()
-        }
-
-        Message::Captured(capture) => {
-            let selection = capture.preset.map(|(x, y, width, height)| {
-                let scale = capture.scale;
-                Selection(iced::Rectangle::new(
-                    iced::Point::new(x as f32 / scale, y as f32 / scale),
-                    iced::Size::new(width as f32 / scale, height as f32 / scale),
-                ))
-            });
-
-            let screen = shot::png_dimensions(&capture.png).map(|(width, height)| {
-                iced::Size::new(
-                    width as f32 / capture.scale,
-                    height as f32 / capture.scale,
-                )
-            });
-
-            state.overlay = Some(Overlay {
-                handle: image::Handle::from_bytes(capture.png.clone()),
-                capture,
-                selection,
-                screen,
-                tool: None,
-                annotations: Vec::new(),
-                drawing: None,
-                ink: annotate::PALETTE[0].1,
-                width: annotate::WIDTHS[1],
-                undone: Vec::new(),
-            });
-
-            show_overlay(state)
-        }
-
-        Message::Canvas(action) => {
-            let Some(overlay) = &mut state.overlay else {
-                return Task::none();
-            };
-
-            match action {
-                overlay::Action::Select(selection) => overlay.selection = Some(selection),
-
-                overlay::Action::Begin(at) => {
-                    if let Some(tool) = overlay.tool {
-                        let (ink, width) = tool.ink(overlay.ink, overlay.width);
-                        overlay.drawing = Some(Annotation::new(tool, at, ink, width));
-                    }
-                }
-
-                overlay::Action::Extend(to) => {
-                    if let Some(drawing) = &mut overlay.drawing {
-                        drawing.extend(to);
-                    }
-                }
-
-                // A click that drew nothing is dropped rather than left as an
-                // invisible entry that Undo would appear to ignore.
-                overlay::Action::Finish => {
-                    if let Some(drawing) = overlay.drawing.take() {
-                        if drawing.is_usable() {
-                            overlay.annotations.push(drawing);
-                            // Drawing something new abandons the redo trail,
-                            // the same as every other editor.
-                            overlay.undone.clear();
+                            crate::overlay::present(&app, capture, move |done| {
+                                match done {
+                                    // Extract and Translate hand the cropped
+                                    // pixels straight back to the OCR worker;
+                                    // re-dragging a region would be absurd when
+                                    // one has just been selected.
+                                    crate::overlay::Done::Recognise { png, raw } => {
+                                        window.dispatch(Verb::OcrImage { png, raw });
+                                    }
+                                    crate::overlay::Done::Handled(status) => {
+                                        window.note(&status);
+                                    }
+                                    crate::overlay::Done::Cancelled => {}
+                                }
+                            });
                         }
                     }
                 }
-            }
-
-            Task::none()
+            });
         }
 
-        Message::PickTool(tool) => {
-            if let Some(overlay) = &mut state.overlay {
-                // Picking the tool you already hold puts the mouse back to
-                // selecting, so one key both enters and leaves a tool.
-                overlay.tool = if overlay.tool == tool { None } else { tool };
-                overlay.drawing = None;
-            }
-            Task::none()
-        }
+        {
+            let window = window.clone();
+            let triggers = trigger_rx.clone();
 
-        Message::Undo => {
-            if let Some(overlay) = &mut state.overlay {
-                if let Some(annotation) = overlay.annotations.pop() {
-                    overlay.undone.push(annotation);
+            glib::spawn_future_local(async move {
+                let _hold = hold;
+
+                while let Ok(verb) = triggers.recv().await {
+                    window.dispatch(verb);
                 }
-            }
-            Task::none()
+            });
         }
-
-        Message::Redo => {
-            if let Some(overlay) = &mut state.overlay {
-                if let Some(annotation) = overlay.undone.pop() {
-                    overlay.annotations.push(annotation);
-                }
-            }
-            Task::none()
-        }
-
-        Message::PickColor(ink) => {
-            if let Some(overlay) = &mut state.overlay {
-                overlay.ink = ink;
-            }
-            Task::none()
-        }
-
-        Message::CycleWidth => {
-            if let Some(overlay) = &mut state.overlay {
-                let next = annotate::WIDTHS
-                    .iter()
-                    .position(|width| (*width - overlay.width).abs() < 0.01)
-                    .map(|index| (index + 1) % annotate::WIDTHS.len())
-                    .unwrap_or(0);
-
-                overlay.width = annotate::WIDTHS[next];
-            }
-            Task::none()
-        }
-
-        Message::PreviewOpened(id) => {
-            state.overlay_window = Some(id);
-            Task::none()
-        }
-
-        Message::Shot(what) => commit(state, what),
-
-        Message::EscapeOverlay => {
-            let holding_tool = state
-                .overlay
-                .as_ref()
-                .is_some_and(|overlay| overlay.tool.is_some());
-
-            if holding_tool {
-                update(state, Message::PickTool(None))
-            } else {
-                commit(state, Commit::Close)
-            }
-        }
-
-        Message::SourceEdit(action) => {
-            let changed = action.is_edit();
-            state.source.perform(action);
-
-            if !changed {
-                return Task::none();
-            }
-
-            state.generation += 1;
-            settle(state.generation)
-        }
-
-        // The translation pane is editable so you can tweak wording before
-        // copying, but editing it must not trigger anything.
-        Message::TargetEdit(action) => {
-            state.target.perform(action);
-            Task::none()
-        }
-
-        Message::PickSource(lang) => {
-            state.settings.use_source(&lang);
-            persist(&state.settings);
-            retranslate(state)
-        }
-
-        Message::PickTarget(lang) => {
-            state.settings.use_target(&lang);
-            persist(&state.settings);
-            retranslate(state)
-        }
-
-        Message::Swap => {
-            state.settings.swap();
-            persist(&state.settings);
-
-            // Swap the panes too, so the thing you were reading becomes the
-            // thing you are translating.
-            let source = state.source.text();
-            let target = state.target.text();
-            state.source = text_editor::Content::with_text(target.trim());
-            state.target = text_editor::Content::with_text(source.trim());
-
-            retranslate(state)
-        }
-
-        Message::Settle(generation) => {
-            if generation == state.generation {
-                retranslate(state)
-            } else {
-                Task::none()
-            }
-        }
-
-        Message::Copy => {
-            let _ = clip::copy(state.target.text().trim());
-            state.status = Some("copied".into());
-            Task::none()
-        }
-
-        Message::Dismiss => match state.window.take() {
-            Some(id) => window::close(id),
-            None => Task::none(),
-        },
-
-        Message::Ignore => Task::none(),
-    }
-}
-
-/// Settings failing to save should never break the thing you were doing, so it
-/// surfaces on stderr rather than in the UI.
-fn persist(settings: &Settings) {
-    if let Err(error) = settings.save() {
-        eprintln!("wl-translate: could not save settings: {error:#}");
-    }
-}
-
-fn dispatch(state: &State, verb: Verb) -> Task<Message> {
-    if let Some(sender) = &state.jobs {
-        let mut job = Job::new(verb);
-        job.from = state.settings.source.clone();
-        job.to = state.settings.effective_target();
-        job.engine = state.settings.engine.clone();
-        job.freeze = state.settings.freeze;
-
-        let _ = sender.send(job);
-    }
-
-    Task::none()
-}
-
-fn retranslate(state: &mut State) -> Task<Message> {
-    let source = state.source.text().trim().to_string();
-
-    if source.is_empty() {
-        return Task::none();
-    }
-
-    dispatch(state, Verb::Text(source))
-}
-
-fn settle(generation: u64) -> Task<Message> {
-    Task::perform(
-        async move {
-            tokio::time::sleep(SETTLE).await;
-            generation
-        },
-        Message::Settle,
-    )
-}
-
-fn show(state: &mut State) -> Task<Message> {
-    if state.window.is_some() {
-        return Task::none();
-    }
-
-    let (id, task) = window::open(window::Settings {
-        size: iced::Size::new(760.0, 420.0),
-        min_size: Some(iced::Size::new(420.0, 260.0)),
-        // This, not `iced::Settings::id`, is what becomes the Wayland app_id.
-        // Setting only the application-level id leaves the window with an empty
-        // class, and compositor rules have nothing to match on.
-        platform_specific: window::settings::PlatformSpecific {
-            application_id: "wl-translate".to_string(),
-            ..Default::default()
-        },
-        ..Default::default()
     });
 
-    state.window = Some(id);
-    task.map(Message::Opened)
+    // GTK would otherwise try to parse our own CLI arguments as its own.
+    let empty: [&str; 0] = [];
+    app.run_with_args(&empty);
+
+    Ok(())
 }
 
-/// Crop what is selected out of the frozen output, then act on it.
-///
-/// Nothing has touched the clipboard or the disk until this runs - that is the
-/// whole point of the overlay.
-fn commit(state: &mut State, what: Commit) -> Task<Message> {
-    if what == Commit::Close {
-        return close_overlay(state);
-    }
+fn spawn_worker(
+    langs: String,
+    jobs: std::sync::mpsc::Receiver<Job>,
+    events: async_channel::Sender<Event>,
+) {
+    std::thread::spawn(move || {
+        let mut worker = Worker::new(langs);
 
-    let Some(overlay) = &state.overlay else {
-        return close_overlay(state);
-    };
-
-    if !overlay::is_usable(overlay.selection) {
-        state.status = Some("nothing selected".into());
-        return Task::none();
-    }
-
-    let image = shot::png_dimensions(&overlay.capture.png)
-        .map(|(width, height)| iced::Size::new(width, height))
-        .unwrap_or(iced::Size::new(0, 0));
-
-    let Some(cropped) = overlay
-        .selection
-        .and_then(|selection| selection.to_pixels(overlay.capture.scale, image))
-        .map(|(x, y, width, height)| shot::crop(&overlay.capture.png, x, y, width, height))
-    else {
-        state.status = Some("nothing selected".into());
-        return Task::none();
-    };
-
-    let cropped = match cropped {
-        Ok(cropped) => cropped,
-        Err(error) => {
-            state.status = Some(format!("{error:#}"));
-            return close_overlay(state);
-        }
-    };
-
-    // Annotations are recorded in screen points; the crop starts at the
-    // selection's corner, so shifting by that and scaling lands them exactly
-    // where they were drawn. Anything outside the crop falls off the pixmap.
-    let origin = overlay
-        .selection
-        .map(|selection| selection.0.position())
-        .unwrap_or(iced::Point::ORIGIN);
-
-    let cropped = match annotate::rasterize(
-        &overlay.annotations,
-        &cropped,
-        origin,
-        overlay.capture.scale,
-    ) {
-        Ok(annotated) => annotated,
-        Err(error) => {
-            state.status = Some(format!("{error:#}"));
-            return close_overlay(state);
-        }
-    };
-
-    match what {
-        Commit::Copy => {
-            state.status = match shot::copy_image(&cropped) {
-                Ok(()) => Some("copied".into()),
-                Err(error) => Some(format!("{error:#}")),
-            };
-        }
-
-        Commit::Save => {
-            let _ = shot::copy_image(&cropped);
-
-            state.status = match shot::save(&cropped) {
-                Ok(path) => Some(format!("saved {}", path.display())),
-                Err(error) => Some(format!("{error:#}")),
-            };
-        }
-
-        // Both hand the pixels straight to the OCR worker. Re-dragging a region
-        // would be absurd when one has just been selected.
-        Commit::Extract | Commit::Translate => {
-            state.copy_when_done = what == Commit::Extract;
-
-            let verb = Verb::OcrImage {
-                png: cropped,
-                raw: what == Commit::Extract,
+        while let Ok(job) = jobs.recv() {
+            let event = match worker.run(&job) {
+                Ok(Some(Product::Text(outcome))) => Event::Finished(outcome),
+                Ok(Some(Product::Shot(capture))) => Event::Captured(capture),
+                Ok(None) => continue,
+                Err(error) => Event::Failed(format!("{error:#}")),
             };
 
-            let dispatched = dispatch(state, verb);
-            let closed = close_overlay(state);
-
-            return Task::batch([dispatched, closed]);
-        }
-
-        Commit::Close => unreachable!("handled above"),
-    }
-
-    close_overlay(state)
-}
-
-/// Fullscreen and undecorated/// Fullscreen and undecorated, so the frozen capture lines up pixel for pixel
-/// with the screen it was taken from.
-fn show_overlay(state: &mut State) -> Task<Message> {
-    if state.overlay_window.is_some() {
-        return Task::none();
-    }
-
-    // Fullscreen is the app's own decision, not a compositor rule's: the
-    // overlay has to cover the output exactly or the selection stops lining up
-    // with the capture behind it, and that is too important to depend on a
-    // window rule being present and correct. The explicit size is a fallback
-    // for anything that ignores the fullscreen request.
-    //
-    // A `float` rule must NOT be added for this window: floating it makes
-    // Hyprland honour the toolkit's default 1024x768 instead, which is exactly
-    // how the overlay ended up small.
-    let size = state
-        .overlay
-        .as_ref()
-        .and_then(|overlay| {
-            shot::png_dimensions(&overlay.capture.png).map(|(width, height)| {
-                iced::Size::new(
-                    width as f32 / overlay.capture.scale,
-                    height as f32 / overlay.capture.scale,
-                )
-            })
-        })
-        .unwrap_or(iced::Size::new(1920.0, 1080.0));
-
-    // `fullscreen` ALONE. Pairing it with an explicit `size` made Hyprland treat
-    // this as an ordinary sized window and tile it at 924x1050, and a `float`
-    // rule made it fall back to the toolkit default of 1024x768. Both were
-    // tried; only the bare fullscreen request actually covers the output.
-    let _ = size;
-
-    let (id, task) = window::open(window::Settings {
-        fullscreen: true,
-        decorations: false,
-        platform_specific: window::settings::PlatformSpecific {
-            application_id: "wl-translate-overlay".to_string(),
-            ..Default::default()
-        },
-        ..Default::default()
-    });
-
-    state.overlay_window = Some(id);
-    task.map(Message::PreviewOpened)
-}
-
-fn close_overlay(state: &mut State) -> Task<Message> {
-    state.overlay = None;
-
-    match state.overlay_window.take() {
-        Some(id) => window::close(id),
-        None => Task::none(),
-    }
-}
-
-/// Height of the toolbar strip, used both to lay it out and to decide which
-/// screen edge it can sit on without covering the selection.
-const TOOLBAR: f32 = 72.0;
-/// Width of the tool strip, used the same way for the left/right choice.
-const SIDEBAR: f32 = 190.0;
-
-/// The commit actions, stuck to whichever horizontal screen edge the selection
-/// leaves clear. They do not follow the selection around - they only get out of
-/// its way.
-fn action_bar(overlay: &Overlay) -> Element<'_, Message> {
-    let screen = overlay.screen.unwrap_or(iced::Size::new(1920.0, 1080.0));
-    let anchor = overlay::toolbar_anchor(overlay.selection, screen, TOOLBAR);
-
-    let actions = [
-        Commit::Copy,
-        Commit::Save,
-        Commit::Extract,
-        Commit::Translate,
-        Commit::Close,
-    ]
-    .into_iter()
-    .fold(row![].spacing(8), |strip, action| {
-        strip.push(button(text(action.label()).size(12)).on_press(Message::Shot(action)))
-    });
-
-    container(actions)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(Alignment::Center)
-        .align_y(match anchor {
-            overlay::Anchor::Top => Alignment::Start,
-            overlay::Anchor::Bottom => Alignment::End,
-        })
-        .padding(20)
-        .into()
-}
-
-/// Drawing tools, colours and thickness, on whichever vertical edge the
-/// selection leaves clear.
-fn tool_strip(overlay: &Overlay) -> Element<'_, Message> {
-    let screen = overlay.screen.unwrap_or(iced::Size::new(1920.0, 1080.0));
-    let side = overlay::sidebar_anchor(overlay.selection, screen, SIDEBAR);
-
-    let tools = [
-        Tool::Pen,
-        Tool::Arrow,
-        Tool::Rectangle,
-        Tool::Ellipse,
-        Tool::Highlight,
-        Tool::Blur,
-    ]
-    .into_iter()
-    .fold(column![].spacing(6), |stack, tool| {
-        let chip = button(text(tool.label()).size(12))
-            .width(Length::Fill)
-            .on_press(Message::PickTool(Some(tool)));
-
-        stack.push(if overlay.tool == Some(tool) {
-            chip.style(button::primary)
-        } else {
-            chip.style(button::secondary)
-        })
-    });
-
-    // Swatches are numbered, so the label doubles as its own shortcut.
-    let colors = annotate::PALETTE.iter().enumerate().fold(
-        row![].spacing(4),
-        |strip, (index, (_name, ink))| {
-            let ink = *ink;
-            let selected = overlay.ink == ink;
-
-            strip.push(
-                button(text(format!("{}", index + 1)).size(11))
-                    .width(30)
-                    .style(move |_theme, _status| button::Style {
-                        background: Some(iced::Color::from_rgba(ink[0], ink[1], ink[2], 1.0).into()),
-                        text_color: if ink[0] + ink[1] + ink[2] > 2.0 {
-                            iced::Color::BLACK
-                        } else {
-                            iced::Color::WHITE
-                        },
-                        border: iced::Border {
-                            width: if selected { 2.0 } else { 0.0 },
-                            color: iced::Color::WHITE,
-                            radius: 4.0.into(),
-                        },
-                        ..button::Style::default()
-                    })
-                    .on_press(Message::PickColor(ink)),
-            )
-        },
-    );
-
-    let history = row![
-        button(text("Undo").size(12))
-            .style(button::secondary)
-            .on_press(Message::Undo),
-        button(text("Redo").size(12))
-            .style(button::secondary)
-            .on_press(Message::Redo),
-    ]
-    .spacing(6);
-
-    let panel = column![
-        tools,
-        colors,
-        button(text(format!("Width {}  (w)", overlay.width as u32)).size(12))
-            .width(Length::Fill)
-            .style(button::secondary)
-            .on_press(Message::CycleWidth),
-        history,
-    ]
-    .spacing(8)
-    .width(SIDEBAR);
-
-    container(panel)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_y(Alignment::Center)
-        .align_x(match side {
-            overlay::Side::Left => Alignment::Start,
-            overlay::Side::Right => Alignment::End,
-        })
-        .padding(20)
-        .into()
-}
-
-fn view(state: &State, window_id: window::Id) -> Element<'_, Message> {
-    if state.overlay_window == Some(window_id) {
-        if let Some(overlay) = &state.overlay {
-            // No padding, no chrome: the canvas has to be exactly the window,
-            // or the capture would be drawn scaled and every selection
-            // coordinate would be off.
-            return iced::widget::Stack::new()
-                .push(
-                    image(overlay.handle.clone())
-                        .content_fit(iced::ContentFit::Fill)
-                        .width(Length::Fill)
-                        .height(Length::Fill),
-                )
-                .push(
-                    iced::widget::Canvas::new(overlay::Selector {
-                        selection: overlay.selection,
-                        tool: overlay.tool,
-                        annotations: &overlay.annotations,
-                        drawing: overlay.drawing.as_ref(),
-                    })
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-                )
-                .push(action_bar(overlay))
-                .push(tool_strip(overlay))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
-        }
-    }
-
-    translate_view(state)
-}
-
-fn translate_view(state: &State) -> Element<'_, Message> {
-    let source_label = match (&state.settings.source, &state.detected) {
-        (source, Some(detected)) if source == "auto" => format!("auto - {detected}"),
-        _ => String::new(),
-    };
-
-    let header = row![
-        container(chips(
-            Settings::chips(&state.settings.recent_source),
-            &state.settings.source,
-            Message::PickSource,
-        ))
-        .width(Length::FillPortion(1)),
-        button(text("<>").size(12)).on_press(Message::Swap),
-        container(chips(
-            Settings::chips(&state.settings.recent_target),
-            &state.settings.target,
-            Message::PickTarget,
-        ))
-        .width(Length::FillPortion(1))
-        .align_x(Alignment::End),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
-
-    // clip(true) contains a cosmic-text bidi bug: a line that mixes Latin into
-    // right-to-left text (a Persian sentence containing "OCR", say) is wrapped
-    // on the logical string and only then reordered visually, so the drawn line
-    // comes out wider than the width it was wrapped to and bleeds past the left
-    // edge into the neighbouring pane. Pure-Persian lines are fine. Clipping
-    // keeps it inside its own box; the real fix belongs upstream.
-    let panes = row![
-        container(
-            text_editor(&state.source)
-                .on_action(Message::SourceEdit)
-                .placeholder("Nothing captured yet")
-                .height(Length::Fill)
-        )
-        .width(Length::FillPortion(1))
-        .height(Length::Fill)
-        .clip(true),
-        container(
-            text_editor(&state.target)
-                .on_action(Message::TargetEdit)
-                .placeholder("Translation")
-                .height(Length::Fill)
-        )
-        .width(Length::FillPortion(1))
-        .height(Length::Fill)
-        .clip(true),
-    ]
-    .spacing(10)
-    .height(Length::Fill);
-
-    let footer = row![
-        button(text("Copy").size(12)).on_press(Message::Copy),
-        container(
-            text(state.status.clone().unwrap_or(source_label))
-                .size(11)
-                .width(Length::Fill)
-        )
-        .width(Length::Fill),
-        button(text("Close").size(12)).on_press(Message::Dismiss),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
-
-    container(
-        column![header, rule::horizontal(1), panes, footer]
-            .spacing(10)
-            .height(Length::Fill),
-    )
-    .padding(12)
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
-}
-
-/// One side's language row. "auto" leads, then most-recently-used.
-///
-/// Takes the list by value: it is built fresh each frame, and borrowing it
-/// would tie the returned widget to a temporary.
-fn chips(
-    langs: Vec<String>,
-    active: &str,
-    on_pick: fn(String) -> Message,
-) -> Element<'static, Message> {
-    let mut strip = row![].spacing(4);
-
-    for lang in langs {
-        let is_active = lang == active;
-        let chip = button(text(lang.clone()).size(11)).on_press(on_pick(lang));
-
-        strip = strip.push(if is_active {
-            chip.style(button::primary)
-        } else {
-            chip.style(button::text)
-        });
-    }
-
-    strip.into()
-}
-
-fn subscription(_state: &State) -> Subscription<Message> {
-    Subscription::batch([
-        Subscription::run(events),
-        window::close_events().map(Message::Closed),
-        if _state.overlay_window.is_some() {
-            iced::keyboard::listen().map(review_key)
-        } else {
-            iced::keyboard::listen().map(translate_key)
-        },
-    ])
-}
-
-/// While the overlay is up, every toolbar button also has a key.
-fn review_key(event: iced::keyboard::Event) -> Message {
-    use iced::keyboard::key::Named;
-    use iced::keyboard::{Event, Key};
-
-    let Event::KeyPressed { key, modifiers, .. } = event else {
-        return Message::Ignore;
-    };
-
-    match key {
-        Key::Named(Named::Enter | Named::Space) => Message::Shot(Commit::Save),
-        // Esc backs out of a tool first, and only closes once the mouse is
-        // selecting again - so it never throws away a capture you were still
-        // drawing on.
-        Key::Named(Named::Escape) => Message::EscapeOverlay,
-        Key::Character(character) => match character.as_str() {
-            "z" if modifiers.control() && modifiers.shift() => Message::Redo,
-            "z" if modifiers.control() => Message::Undo,
-            "y" if modifiers.control() => Message::Redo,
-            "p" => Message::PickTool(Some(Tool::Pen)),
-            "a" => Message::PickTool(Some(Tool::Arrow)),
-            "r" => Message::PickTool(Some(Tool::Rectangle)),
-            "o" => Message::PickTool(Some(Tool::Ellipse)),
-            "h" => Message::PickTool(Some(Tool::Highlight)),
-            "b" => Message::PickTool(Some(Tool::Blur)),
-            "w" => Message::CycleWidth,
-            // Swatches are numbered on screen, so the digits match what you see.
-            digit if digit.len() == 1 && digit.chars().all(|c| c.is_ascii_digit()) => {
-                match digit.parse::<usize>() {
-                    Ok(n) if n >= 1 && n <= annotate::PALETTE.len() => {
-                        Message::PickColor(annotate::PALETTE[n - 1].1)
-                    }
-                    _ => Message::Ignore,
-                }
+            if events.send_blocking(event).is_err() {
+                break; // UI is gone
             }
-            // Ctrl+C as well as plain c, since one is muscle memory and the
-            // other is what the button says.
-            "c" => Message::Shot(Commit::Copy),
-            "s" if !modifiers.control() => Message::Shot(Commit::Save),
-            "e" => Message::Shot(Commit::Extract),
-            "t" => Message::Shot(Commit::Translate),
-            _ => Message::Ignore,
-        },
-        _ => Message::Ignore,
-    }
+        }
+    });
 }
 
-fn translate_key(event: iced::keyboard::Event) -> Message {
-    use iced::keyboard::key::Named;
-    use iced::keyboard::{Event, Key};
+/// Serve the D-Bus verbs from a tokio thread of their own.
+fn spawn_dbus(
+    triggers: async_channel::Sender<Verb>,
+    events: async_channel::Sender<Event>,
+) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("could not start the D-Bus runtime")?;
 
-    match event {
-        Event::KeyPressed {
-            key: Key::Named(Named::Escape),
-            ..
-        } => Message::Dismiss,
-        _ => Message::Ignore,
-    }
-}
+    std::thread::spawn(move || {
+        runtime.block_on(async move {
+            let (verb_tx, mut verb_rx) = tokio::sync::mpsc::unbounded_channel::<Verb>();
 
-/// Owns the D-Bus server and the worker thread for as long as the daemon runs.
-fn events() -> impl Stream<Item = Message> {
-    iced::stream::channel(32, async |mut output| {
-        let (trigger_tx, mut trigger_rx) = mpsc::unbounded_channel::<Verb>();
-        let (job_tx, mut job_rx) = mpsc::unbounded_channel::<Job>();
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Result<Option<Product>, String>>();
+            let built = async {
+                zbus::connection::Builder::session()?
+                    .name(ipc::SERVICE)?
+                    .serve_at(ipc::PATH, ipc::Iface { triggers: verb_tx })?
+                    .build()
+                    .await
+            }
+            .await;
 
-        let langs = LANGS.get().cloned().unwrap_or_else(|| "eng".to_string());
+            // Held for the lifetime of this task: dropping it releases the bus
+            // name and the daemon silently stops answering.
+            let _connection = match built {
+                Ok(connection) => connection,
+                Err(error) => {
+                    let _ = events
+                        .send(Event::Failed(format!(
+                            "could not claim {}: {error}",
+                            ipc::SERVICE
+                        )))
+                        .await;
+                    return;
+                }
+            };
 
-        std::thread::spawn(move || {
-            let mut worker = Worker::new(langs);
-
-            while let Some(job) = job_rx.blocking_recv() {
-                let result = worker.run(&job).map_err(|error| format!("{error:#}"));
-
-                if out_tx.send(result).is_err() {
-                    break; // daemon is shutting down
+            while let Some(verb) = verb_rx.recv().await {
+                if triggers.send(verb).await.is_err() {
+                    break;
                 }
             }
         });
+    });
 
-        let served = async {
-            zbus::connection::Builder::session()?
-                .name(ipc::SERVICE)?
-                .serve_at(
-                    ipc::PATH,
-                    ipc::Iface {
-                        triggers: trigger_tx,
-                    },
-                )?
-                .build()
-                .await
-        }
-        .await;
+    Ok(())
+}
 
-        // Held for the lifetime of this future: dropping it unregisters the bus
-        // name and the daemon silently stops answering.
-        let _connection = match served {
-            Ok(connection) => connection,
-            Err(error) => {
-                let _ = output
-                    .send(Message::Failed(format!(
-                        "could not claim {}: {error}",
-                        ipc::SERVICE
-                    )))
-                    .await;
-                return;
-            }
+fn build_window(app: &gtk::Application, jobs: std::sync::mpsc::Sender<Job>) -> Window {
+    let window = gtk::ApplicationWindow::builder()
+        .application(app)
+        .title("wl-translate")
+        .default_width(820)
+        .default_height(440)
+        .build();
+
+    let source = text_pane();
+    let target = text_pane();
+
+    let source_chips = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let target_chips = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    source_chips.set_hexpand(true);
+    target_chips.set_halign(gtk::Align::End);
+    target_chips.set_hexpand(true);
+
+    let swap = gtk::Button::from_icon_name("object-flip-horizontal-symbolic");
+    swap.set_tooltip_text(Some("Swap languages"));
+    swap.add_css_class("flat");
+    swap.add_css_class("circular");
+
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    header.append(&source_chips);
+    header.append(&swap);
+    header.append(&target_chips);
+
+    let status = gtk::Label::builder().xalign(0.0).hexpand(true).build();
+    status.add_css_class("dim-label");
+
+    let panes = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    panes.set_homogeneous(true);
+    panes.set_vexpand(true);
+    panes.append(&scrolled(&source));
+    panes.append(&scrolled(&target));
+
+    // Icons and GTK's own style classes throughout, so the window looks like
+    // whatever the system theme says a GTK window looks like. Nothing here sets
+    // a colour or a font of its own.
+    let copy = gtk::Button::from_icon_name("edit-copy-symbolic");
+    copy.set_tooltip_text(Some("Copy the translation"));
+
+    let close = gtk::Button::from_icon_name("window-close-symbolic");
+    close.set_tooltip_text(Some("Close"));
+
+    let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    footer.append(&copy);
+    footer.append(&status);
+    footer.append(&close);
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    root.set_margin_top(12);
+    root.set_margin_bottom(12);
+    root.set_margin_start(12);
+    root.set_margin_end(12);
+    root.append(&header);
+    root.append(&panes);
+    root.append(&footer);
+
+    window.set_child(Some(&root));
+
+    {
+        let window = window.clone();
+        close.connect_clicked(move |_| window.set_visible(false));
+    }
+
+    {
+        let target = target.clone();
+        copy.connect_clicked(move |_| {
+            let buffer = target.buffer();
+            let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+            let _ = crate::clip::copy(text.trim());
+        });
+    }
+
+    Window {
+        window,
+        source,
+        target,
+        status,
+        source_chips,
+        target_chips,
+        swap_button: swap,
+        settings: RefCell::new(Settings::load()),
+        jobs,
+        generation: Cell::new(0),
+        quiet: Cell::new(false),
+    }
+}
+
+/// Signals that need the finished `Window`, so they cannot be connected while
+/// it is still being built. Everything captures a weak reference: a strong one
+/// would have the window own a closure that owns the window.
+fn wire(window: &Rc<Window>) {
+    let buffer = window.source.buffer();
+    let weak = Rc::downgrade(window);
+
+    buffer.connect_changed(move |_| {
+        let Some(window) = weak.upgrade() else {
+            return;
         };
 
-        let _ = output.send(Message::Ready(job_tx)).await;
+        // Our own writes are not edits.
+        if window.quiet.get() {
+            return;
+        }
 
-        loop {
-            let message = tokio::select! {
-                Some(verb) = trigger_rx.recv() => Message::Trigger(verb),
-                Some(result) = out_rx.recv() => match result {
-                    Ok(Some(Product::Text(outcome))) => Message::Finished(outcome),
-                    Ok(Some(Product::Shot(capture))) => Message::Captured(capture),
-                    Ok(None) => continue, // cancelled drag, or a UI-only verb
-                    Err(error) => Message::Failed(error),
-                },
-                else => break,
+        let generation = window.generation.get() + 1;
+        window.generation.set(generation);
+
+        let weak = Rc::downgrade(&window);
+
+        glib::timeout_add_local_once(SETTLE, move || {
+            let Some(window) = weak.upgrade() else {
+                return;
             };
 
-            let _ = output.send(message).await;
+            // Only the newest tick survives; the rest were superseded by
+            // further typing.
+            if window.generation.get() == generation {
+                window.retranslate();
+            }
+        });
+    });
+
+    let weak = Rc::downgrade(window);
+
+    window.swap_button.connect_clicked(move |_| {
+        if let Some(window) = weak.upgrade() {
+            window.swap();
+            rebuild_chips(&window);
         }
-    })
+    });
+}
+
+/// Language chips for both sides, rebuilt so the most-recently-used order stays
+/// visible and the active language stays highlighted.
+fn rebuild_chips(window: &Rc<Window>) {
+    for strip in [&window.source_chips, &window.target_chips] {
+        while let Some(child) = strip.first_child() {
+            strip.remove(&child);
+        }
+    }
+
+    let (source, target, recent_source, recent_target) = {
+        let settings = window.settings.borrow();
+        (
+            settings.source.clone(),
+            settings.target.clone(),
+            settings.recent_source.clone(),
+            settings.recent_target.clone(),
+        )
+    };
+
+    for (strip, recent, active, is_source) in [
+        (&window.source_chips, recent_source, source, true),
+        (&window.target_chips, recent_target, target, false),
+    ] {
+        for lang in Settings::chips(&recent) {
+            let chip = gtk::Button::with_label(&lang);
+            chip.add_css_class("flat");
+
+            if lang == active {
+                chip.add_css_class("suggested-action");
+            }
+
+            let weak = Rc::downgrade(window);
+            let lang = lang.clone();
+
+            chip.connect_clicked(move |_| {
+                let Some(window) = weak.upgrade() else {
+                    return;
+                };
+
+                window.pick_language(&lang, is_source);
+                rebuild_chips(&window);
+            });
+
+            strip.append(&chip);
+        }
+    }
+}
+
+/// A wrapping, editable text view.
+///
+/// The important part is what is NOT configured here. Pango derives paragraph
+/// direction from the text itself, so a Persian paragraph lays out right to
+/// left and an Italian one left to right - in the same buffer - with the caret
+/// and selection behaving correctly in both. That is the whole reason for this
+/// branch, and it costs zero lines.
+fn text_pane() -> gtk::TextView {
+    let view = gtk::TextView::new();
+    view.set_wrap_mode(gtk::WrapMode::WordChar);
+    view.set_top_margin(8);
+    view.set_bottom_margin(8);
+    view.set_left_margin(8);
+    view.set_right_margin(8);
+    view
+}
+
+fn scrolled(view: &gtk::TextView) -> gtk::ScrolledWindow {
+    gtk::ScrolledWindow::builder()
+        .child(view)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .has_frame(true)
+        .vexpand(true)
+        .build()
+}
+
+impl Window {
+    fn dispatch(&self, verb: Verb) {
+        if matches!(verb, Verb::Show) {
+            self.present();
+            return;
+        }
+
+        let settings = self.settings.borrow();
+
+        let mut job = Job::new(verb);
+        job.from = settings.source.clone();
+        job.to = settings.effective_target();
+        job.engine = settings.engine.clone();
+        job.freeze = settings.freeze;
+
+        let _ = self.jobs.send(job);
+    }
+
+    fn present(&self) {
+        self.window.set_visible(true);
+        self.window.present();
+    }
+
+    fn show_outcome(&self, outcome: &Outcome) {
+        self.quiet.set(true);
+        self.source.buffer().set_text(&outcome.source);
+        self.target.buffer().set_text(&outcome.translation);
+        self.quiet.set(false);
+
+        self.status
+            .set_text(&format!("{} \u{2192} {}", outcome.from, outcome.to));
+
+        self.present();
+    }
+
+    fn source_text(&self) -> String {
+        let buffer = self.source.buffer();
+        buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .trim()
+            .to_string()
+    }
+
+    /// Translate whatever is in the source pane, with the current languages.
+    fn retranslate(&self) {
+        let text = self.source_text();
+
+        if !text.is_empty() {
+            self.dispatch(Verb::Text(text));
+        }
+    }
+
+    fn pick_language(&self, lang: &str, is_source: bool) {
+        {
+            let mut settings = self.settings.borrow_mut();
+
+            if is_source {
+                settings.use_source(lang);
+            } else {
+                settings.use_target(lang);
+            }
+
+            if let Err(error) = settings.save() {
+                eprintln!("wl-translate: could not save settings: {error:#}");
+            }
+        }
+
+        self.retranslate();
+    }
+
+    fn swap(&self) {
+        {
+            let mut settings = self.settings.borrow_mut();
+            settings.swap();
+
+            if let Err(error) = settings.save() {
+                eprintln!("wl-translate: could not save settings: {error:#}");
+            }
+        }
+
+        // Swap the panes too, so what you were reading becomes what you are
+        // translating.
+        let target_buffer = self.target.buffer();
+        let translation = target_buffer
+            .text(&target_buffer.start_iter(), &target_buffer.end_iter(), false)
+            .trim()
+            .to_string();
+        let source = self.source_text();
+
+        self.quiet.set(true);
+        self.source.buffer().set_text(&translation);
+        self.target.buffer().set_text(&source);
+        self.quiet.set(false);
+
+        self.retranslate();
+    }
+
+    /// Report something without forcing the window into view - a saved
+    /// screenshot should not drag the translator up in front of you.
+    fn note(&self, status: &str) {
+        self.status.set_text(status);
+    }
+
+    fn show_error(&self, error: &str) {
+        self.status.set_text(error);
+        self.present();
+    }
+
 }

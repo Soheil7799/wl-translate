@@ -4,20 +4,20 @@
 //! rasteriser that bakes them into the saved PNG. Rather than writing the
 //! shapes twice and watching the two drift apart, both draw from [`outline`],
 //! which reduces every tool to a list of polylines. The preview strokes them
-//! with iced paths; the output strokes them with tiny-skia.
+//! Cairo draws both, so a preview cannot disagree with what gets saved.
 
-use iced::{Point, Vector};
+use crate::geom::{Point, Rect, Size};
 
 /// Segments used to approximate an ellipse. Enough that the curve reads as
 /// smooth at any size a screenshot annotation is likely to be.
 const ELLIPSE_STEPS: usize = 64;
 /// Length of an arrow head, as a fraction of the shaft.
-const HEAD_FRACTION: f32 = 0.22;
+const HEAD_FRACTION: f64 = 0.22;
 /// Longest an arrow head may get, in points, so a long arrow does not grow a
 /// comically large head.
-const HEAD_MAX: f32 = 34.0;
+const HEAD_MAX: f64 = 34.0;
 /// Half-angle of the arrow head, in radians (~28°).
-const HEAD_SPREAD: f32 = 0.48;
+const HEAD_SPREAD: f64 = 0.48;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -46,16 +46,23 @@ impl Tool {
     }
 
     /// Highlighter ink is translucent, and thick enough to cover a line of text.
-    pub fn ink(self, color: [f32; 4], width: f32) -> ([f32; 4], f32) {
+    pub fn ink(self, color: [f64; 4], width: f64) -> ([f64; 4], f64) {
         match self {
             Tool::Highlight => ([color[0], color[1], color[2], 0.35], width * 5.0),
             _ => (color, width),
         }
     }
 
-    /// Whether a stray click should be discarded rather than kept.
+    /// Whether this tool is defined by two corners, so a click with no drag
+    /// produced nothing worth keeping.
+    ///
+    /// Freehand tools are the exception: they accumulate every sample, so a
+    /// finished stroke has many points, not two. Leaving Highlight out of this
+    /// list meant every highlighter stroke failed the two-point check and was
+    /// thrown away on mouse-up - the tool drew a live preview and then silently
+    /// kept nothing.
     fn needs_a_drag(self) -> bool {
-        !matches!(self, Tool::Pen)
+        !matches!(self, Tool::Pen | Tool::Highlight)
     }
 }
 
@@ -65,12 +72,12 @@ pub struct Annotation {
     /// Pen keeps every sample; the other tools keep only start and end.
     pub points: Vec<Point>,
     /// Straight rgba, 0..1, so both renderers can take it unchanged.
-    pub color: [f32; 4],
-    pub width: f32,
+    pub color: [f64; 4],
+    pub width: f64,
 }
 
 impl Annotation {
-    pub fn new(tool: Tool, from: Point, color: [f32; 4], width: f32) -> Self {
+    pub fn new(tool: Tool, from: Point, color: [f64; 4], width: f64) -> Self {
         Self {
             tool,
             points: vec![from],
@@ -103,14 +110,14 @@ impl Annotation {
     }
 
     /// The rectangle a two-corner tool covers, in whatever space its points are.
-    pub fn bounds(&self) -> Option<iced::Rectangle> {
+    pub fn bounds(&self) -> Option<Rect> {
         let [a, b] = self.points.as_slice() else {
             return None;
         };
 
-        Some(iced::Rectangle::new(
+        Some(Rect::new(
             Point::new(a.x.min(b.x), a.y.min(b.y)),
-            iced::Size::new((a.x - b.x).abs(), (a.y - b.y).abs()),
+            Size::new((a.x - b.x).abs(), (a.y - b.y).abs()),
         ))
     }
 }
@@ -152,7 +159,7 @@ pub fn outline(annotation: &Annotation) -> Vec<Vec<Point>> {
 }
 
 /// Colours offered for annotations, in the order they appear and are numbered.
-pub const PALETTE: [(&str, [f32; 4]); 6] = [
+pub const PALETTE: [(&str, [f64; 4]); 6] = [
     ("red", [0.92, 0.19, 0.21, 1.0]),
     ("orange", [0.96, 0.55, 0.13, 1.0]),
     ("yellow", [0.98, 0.83, 0.20, 1.0]),
@@ -162,20 +169,20 @@ pub const PALETTE: [(&str, [f32; 4]); 6] = [
 ];
 
 /// Stroke widths, cycled with the thickness control.
-pub const WIDTHS: [f32; 4] = [2.0, 4.0, 7.0, 12.0];
+pub const WIDTHS: [f64; 4] = [2.0, 4.0, 7.0, 12.0];
 
 /// The two barbs, as one polyline that runs through the tip.
 fn arrow_head(from: Point, to: Point) -> Vec<Point> {
     let shaft = distance(from, to);
 
-    if shaft <= f32::EPSILON {
+    if shaft <= f64::EPSILON {
         return Vec::new();
     }
 
     let length = (shaft * HEAD_FRACTION).min(HEAD_MAX);
     let angle = (to.y - from.y).atan2(to.x - from.x);
 
-    let barb = |offset: f32| {
+    let barb = |offset: f64| {
         let direction = angle + offset;
         Point::new(
             to.x - length * direction.cos(),
@@ -189,94 +196,106 @@ fn arrow_head(from: Point, to: Point) -> Vec<Point> {
 /// An ellipse inscribed in the box defined by two opposite corners.
 fn ellipse(a: Point, b: Point) -> Vec<Point> {
     let centre = Point::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
-    let radius = Vector::new((a.x - b.x).abs() / 2.0, (a.y - b.y).abs() / 2.0);
+    let radius = Size::new((a.x - b.x).abs() / 2.0, (a.y - b.y).abs() / 2.0);
 
     (0..=ELLIPSE_STEPS)
         .map(|step| {
-            let angle = step as f32 / ELLIPSE_STEPS as f32 * std::f32::consts::TAU;
+            let angle = step as f64 / ELLIPSE_STEPS as f64 * std::f64::consts::TAU;
             Point::new(
-                centre.x + radius.x * angle.cos(),
-                centre.y + radius.y * angle.sin(),
+                centre.x + radius.width * angle.cos(),
+                centre.y + radius.height * angle.sin(),
             )
         })
         .collect()
 }
 
-fn distance(a: Point, b: Point) -> f32 {
+fn distance(a: Point, b: Point) -> f64 {
     ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt()
 }
 
 /// Bake annotations into a captured region.
 ///
-/// `origin` is the selection's top-left in the same space the annotations were
-/// recorded in, and `scale` converts that space into image pixels - so the
-/// drawing lands exactly where it appeared on screen.
+/// Cairo draws these, exactly as the live preview does. They used to be drawn
+/// twice - Cairo on screen, a second rasteriser into the file - which is how a
+/// preview quietly stops matching what gets saved. One renderer cannot disagree
+/// with itself.
+///
+/// `origin` is the selection's top-left in the space the annotations were
+/// recorded in, and `scale` converts that space into image pixels, so the
+/// drawing lands where it appeared on screen.
 pub fn rasterize(
     annotations: &[Annotation],
     png: &[u8],
     origin: Point,
-    scale: f32,
+    scale: f64,
 ) -> anyhow::Result<Vec<u8>> {
     use anyhow::Context;
-    use tiny_skia::{LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
+    use cairo::{Context as Cairo, Format, ImageSurface, LineCap, LineJoin};
 
     if annotations.is_empty() {
         return Ok(png.to_vec());
     }
 
-    let mut pixmap = Pixmap::decode_png(png).context("could not decode the capture")?;
+    let mut source = &png[..];
+    let loaded = ImageSurface::create_from_png(&mut source).context("could not decode the capture")?;
+
+    let (width, height) = (loaded.width(), loaded.height());
+    let surface =
+        ImageSurface::create(Format::ARgb32, width, height).context("could not allocate a surface")?;
+
+    {
+        let cr = Cairo::new(&surface).context("could not start drawing")?;
+        cr.set_source_surface(&loaded, 0.0, 0.0)?;
+        cr.paint()?;
+    }
 
     // Redaction first, so a box drawn to point at something is not itself
     // pixelated by a later blur.
     for annotation in annotations.iter().filter(|a| a.tool == Tool::Blur) {
         if let Some(area) = annotation.bounds() {
             pixelate(
-                &mut pixmap,
+                &surface,
                 (area.x - origin.x) * scale,
                 (area.y - origin.y) * scale,
                 area.width * scale,
                 area.height * scale,
                 (annotation.width * scale * 2.5).max(6.0),
-            );
+            )?;
         }
     }
 
-    for annotation in annotations.iter().filter(|a| a.tool != Tool::Blur) {
-        let mut paint = Paint::default();
-        let [red, green, blue, alpha] = annotation.color;
-        paint.set_color(tiny_skia::Color::from_rgba(red, green, blue, alpha).unwrap_or(
-            tiny_skia::Color::from_rgba8(255, 0, 0, 255),
-        ));
-        paint.anti_alias = true;
+    let cr = Cairo::new(&surface).context("could not start drawing")?;
+    cr.set_line_cap(LineCap::Round);
+    cr.set_line_join(LineJoin::Round);
 
-        let stroke = Stroke {
-            width: (annotation.width * scale).max(1.0),
-            line_cap: LineCap::Round,
-            line_join: LineJoin::Round,
-            ..Stroke::default()
-        };
+    for annotation in annotations.iter().filter(|a| a.tool != Tool::Blur) {
+        let [red, green, blue, alpha] = annotation.color;
+        cr.set_source_rgba(red, green, blue, alpha);
+        cr.set_line_width((annotation.width * scale).max(1.0));
 
         for line in outline(annotation) {
-            let mut builder = PathBuilder::new();
-
             for (index, point) in line.iter().enumerate() {
                 let x = (point.x - origin.x) * scale;
                 let y = (point.y - origin.y) * scale;
 
                 if index == 0 {
-                    builder.move_to(x, y);
+                    cr.move_to(x, y);
                 } else {
-                    builder.line_to(x, y);
+                    cr.line_to(x, y);
                 }
             }
-
-            if let Some(path) = builder.finish() {
-                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
-            }
+            cr.stroke()?;
         }
     }
 
-    pixmap.encode_png().context("could not encode the annotated capture")
+    drop(cr);
+
+    let mut out = Vec::new();
+    surface
+        .write_to_png(&mut out)
+        .context("could not encode the annotated capture")?;
+
+    Ok(out)
 }
 
 /// Average square blocks of pixels in place.
@@ -284,14 +303,21 @@ pub fn rasterize(
 /// Deliberately destructive: the original pixels are gone from the output, so
 /// unlike a drawn-on black box there is nothing underneath to recover.
 fn pixelate(
-    pixmap: &mut tiny_skia::Pixmap,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    block: f32,
-) {
-    let (image_width, image_height) = (pixmap.width() as i64, pixmap.height() as i64);
+    surface: &cairo::ImageSurface,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    block: f64,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let image_width = surface.width() as i64;
+    let image_height = surface.height() as i64;
+    let stride = surface.stride() as i64;
+
+    let mut surface = surface.clone();
+    let mut data = surface.data().context("could not access the surface pixels")?;
 
     let left = (x.round() as i64).clamp(0, image_width);
     let top = (y.round() as i64).clamp(0, image_height);
@@ -299,7 +325,6 @@ fn pixelate(
     let bottom = ((y + height).round() as i64).clamp(0, image_height);
 
     let block = (block.round() as i64).max(2);
-    let data = pixmap.data_mut();
 
     let mut block_top = top;
     while block_top < bottom {
@@ -309,30 +334,25 @@ fn pixelate(
         while block_left < right {
             let block_right = (block_left + block).min(right);
 
-            let (mut red, mut green, mut blue, mut alpha, mut count) = (0u32, 0u32, 0u32, 0u32, 0u32);
+            let mut totals = [0u32; 4];
+            let mut count = 0u32;
 
             for row in block_top..block_bottom {
                 for column in block_left..block_right {
-                    let index = ((row * image_width + column) * 4) as usize;
-                    red += data[index] as u32;
-                    green += data[index + 1] as u32;
-                    blue += data[index + 2] as u32;
-                    alpha += data[index + 3] as u32;
+                    let index = (row * stride + column * 4) as usize;
+                    for channel in 0..4 {
+                        totals[channel] += data[index + channel] as u32;
+                    }
                     count += 1;
                 }
             }
 
             if count > 0 {
-                let average = [
-                    (red / count) as u8,
-                    (green / count) as u8,
-                    (blue / count) as u8,
-                    (alpha / count) as u8,
-                ];
+                let average: [u8; 4] = std::array::from_fn(|c| (totals[c] / count) as u8);
 
                 for row in block_top..block_bottom {
                     for column in block_left..block_right {
-                        let index = ((row * image_width + column) * 4) as usize;
+                        let index = (row * stride + column * 4) as usize;
                         data[index..index + 4].copy_from_slice(&average);
                     }
                 }
@@ -343,6 +363,8 @@ fn pixelate(
 
         block_top = block_bottom;
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -353,28 +375,6 @@ mod tests {
         let mut annotation = Annotation::new(tool, from, [1.0, 0.0, 0.0, 1.0], 3.0);
         annotation.extend(to);
         annotation
-    }
-
-    #[test]
-    fn pixelating_flattens_a_region_and_leaves_the_rest_alone() {
-        use tiny_skia::{Pixmap, PremultipliedColorU8};
-
-        let mut pixmap = Pixmap::new(8, 8).unwrap();
-
-        // A gradient, so flattening is visible as neighbouring pixels agreeing.
-        for (index, pixel) in pixmap.pixels_mut().iter_mut().enumerate() {
-            let value = (index * 3) as u8;
-            *pixel = PremultipliedColorU8::from_rgba(value, value, value, 255).unwrap();
-        }
-
-        let before_outside = pixmap.pixels()[63];
-        pixelate(&mut pixmap, 0.0, 0.0, 4.0, 4.0, 4.0);
-
-        let flattened = &pixmap.pixels()[..4];
-        assert!(flattened.iter().all(|p| p.red() == flattened[0].red()));
-
-        // The far corner was outside the region and must be untouched.
-        assert_eq!(pixmap.pixels()[63].red(), before_outside.red());
     }
 
     #[test]

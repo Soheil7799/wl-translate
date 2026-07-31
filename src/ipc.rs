@@ -17,13 +17,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::pipeline::Verb;
 use crate::shot;
 
-// Distinct from the GTK translator daemon on purpose. While both binaries
-// exist they are separate programs with separate windows, and a shared bus name
-// means whichever starts first answers for both - which had this build handing
-// its screenshots to a daemon that has no overlay to show them in, so they
-// vanished silently.
-pub const SERVICE: &str = "org.wl_translate.Shot";
-pub const PATH: &str = "/org/wl_translate/Shot";
+pub const SERVICE: &str = "org.wl_translate.Daemon";
+pub const PATH: &str = "/org/wl_translate/Daemon";
 
 /// Server side. Each method drops a verb on the channel and returns at once -
 /// the caller is a keybind, so it must never block waiting for OCR.
@@ -75,14 +70,10 @@ impl Iface {
     }
 }
 
-// These are string literals the macro needs at compile time, so they CANNOT
-// reference SERVICE and PATH above - they have to be kept in step by hand.
-// Changing the constants and not these is exactly how this build ended up
-// sending its screenshots to the GTK daemon, which silently discards them.
 #[zbus::proxy(
     interface = "org.wl_translate.Daemon1",
-    default_service = "org.wl_translate.Shot",
-    default_path = "/org/wl_translate/Shot"
+    default_service = "org.wl_translate.Daemon",
+    default_path = "/org/wl_translate/Daemon"
 )]
 pub trait Daemon {
     async fn ocr(&self) -> zbus::Result<()>;

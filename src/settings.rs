@@ -28,6 +28,13 @@ pub struct Settings {
     /// Hold the screen still while dragging an OCR region, so a video or a
     /// scrolling page cannot move out from under the selection.
     pub freeze: bool,
+    /// Directory to load tesseract language models from.
+    ///
+    /// Worth setting. Distributions ship the legacy tessdata, whose Persian
+    /// model is a fraction of the size of the one in tessdata_best and reads
+    /// screen-resolution Persian noticeably worse. `None` uses the system
+    /// directory.
+    pub tessdata: Option<String>,
 }
 
 impl Default for Settings {
@@ -40,6 +47,7 @@ impl Default for Settings {
             engine: "google".into(),
             langs: "eng+ita+fas".into(),
             freeze: true,
+            tessdata: None,
         }
     }
 }

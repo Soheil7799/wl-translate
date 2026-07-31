@@ -57,7 +57,7 @@ pub struct Capture {
     /// PNG of the whole focused output.
     pub png: Vec<u8>,
     /// Image pixels per logical point on that output.
-    pub scale: f32,
+    pub scale: f64,
     /// Where the selection should start, in image pixels. `None` means start
     /// with nothing selected and let the drag define it.
     pub preset: Option<(u32, u32, u32, u32)>,
@@ -81,10 +81,10 @@ pub fn capture_for_overlay(mode: Mode) -> Result<Capture> {
         }
         Mode::Window => focused_window_in(&monitor).map(|(x, y, w, h)| {
             (
-                (x as f32 * scale) as u32,
-                (y as f32 * scale) as u32,
-                (w as f32 * scale) as u32,
-                (h as f32 * scale) as u32,
+                (x as f64 * scale) as u32,
+                (y as f64 * scale) as u32,
+                (w as f64 * scale) as u32,
+                (h as f64 * scale) as u32,
             )
         }),
     };
@@ -123,7 +123,7 @@ pub fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
 
 pub struct Monitor {
     pub name: String,
-    pub scale: f32,
+    pub scale: f64,
     pub x: i64,
     pub y: i64,
 }
@@ -144,7 +144,7 @@ fn focused_monitor() -> Result<Monitor> {
             .and_then(Value::as_str)
             .context("output has no name")?
             .to_string(),
-        scale: monitor.get("scale").and_then(Value::as_f64).unwrap_or(1.0) as f32,
+        scale: monitor.get("scale").and_then(Value::as_f64).unwrap_or(1.0),
         x: monitor.get("x").and_then(Value::as_i64).unwrap_or(0),
         y: monitor.get("y").and_then(Value::as_i64).unwrap_or(0),
     })
