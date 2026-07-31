@@ -16,9 +16,10 @@
 //! The worker still owns the OCR engine for the process lifetime, so tesseract
 //! loads once and `LepTess` never crosses a thread boundary.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use gtk::prelude::*;
@@ -36,15 +37,26 @@ enum Event {
     Failed(String),
 }
 
+/// How long to wait after the last keystroke before re-translating.
+const SETTLE: Duration = Duration::from_millis(350);
+
 /// Widgets the update path needs to reach back into.
 struct Window {
     window: gtk::ApplicationWindow,
     source: gtk::TextView,
     target: gtk::TextView,
     status: gtk::Label,
-    chips: gtk::Box,
+    source_chips: gtk::Box,
+    target_chips: gtk::Box,
+    swap_button: gtk::Button,
     settings: RefCell<Settings>,
     jobs: std::sync::mpsc::Sender<Job>,
+    /// Bumped on every edit so a stale debounce tick can be ignored.
+    generation: Cell<u64>,
+    /// Set while the code fills the buffers, because `connect_changed` cannot
+    /// tell our writes from the user's - without this, showing a translation
+    /// would look like an edit and translate itself again, forever.
+    quiet: Cell<bool>,
 }
 
 /// Run the daemon. Blocks until the process is interrupted.
@@ -76,7 +88,8 @@ pub fn run(langs: Option<String>) -> Result<()> {
         let hold = app.hold();
 
         let window = Rc::new(build_window(app, job_tx.clone()));
-        window.rebuild_chips();
+        wire(&window);
+        rebuild_chips(&window);
 
         {
             let window = window.clone();
@@ -196,7 +209,20 @@ fn build_window(app: &gtk::Application, jobs: std::sync::mpsc::Sender<Job>) -> W
     let source = text_pane();
     let target = text_pane();
 
-    let chips = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let source_chips = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let target_chips = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    source_chips.set_hexpand(true);
+    target_chips.set_halign(gtk::Align::End);
+    target_chips.set_hexpand(true);
+
+    let swap = gtk::Button::from_icon_name("object-flip-horizontal-symbolic");
+    swap.set_tooltip_text(Some("Swap languages"));
+    swap.add_css_class("flat");
+
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    header.append(&source_chips);
+    header.append(&swap);
+    header.append(&target_chips);
 
     let status = gtk::Label::builder().xalign(0.0).hexpand(true).build();
     status.add_css_class("dim-label");
@@ -220,7 +246,7 @@ fn build_window(app: &gtk::Application, jobs: std::sync::mpsc::Sender<Job>) -> W
     root.set_margin_bottom(12);
     root.set_margin_start(12);
     root.set_margin_end(12);
-    root.append(&chips);
+    root.append(&header);
     root.append(&panes);
     root.append(&footer);
 
@@ -245,9 +271,106 @@ fn build_window(app: &gtk::Application, jobs: std::sync::mpsc::Sender<Job>) -> W
         source,
         target,
         status,
-        chips,
+        source_chips,
+        target_chips,
+        swap_button: swap,
         settings: RefCell::new(Settings::load()),
         jobs,
+        generation: Cell::new(0),
+        quiet: Cell::new(false),
+    }
+}
+
+/// Signals that need the finished `Window`, so they cannot be connected while
+/// it is still being built. Everything captures a weak reference: a strong one
+/// would have the window own a closure that owns the window.
+fn wire(window: &Rc<Window>) {
+    let buffer = window.source.buffer();
+    let weak = Rc::downgrade(window);
+
+    buffer.connect_changed(move |_| {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+
+        // Our own writes are not edits.
+        if window.quiet.get() {
+            return;
+        }
+
+        let generation = window.generation.get() + 1;
+        window.generation.set(generation);
+
+        let weak = Rc::downgrade(&window);
+
+        glib::timeout_add_local_once(SETTLE, move || {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+
+            // Only the newest tick survives; the rest were superseded by
+            // further typing.
+            if window.generation.get() == generation {
+                window.retranslate();
+            }
+        });
+    });
+
+    let weak = Rc::downgrade(window);
+
+    window.swap_button.connect_clicked(move |_| {
+        if let Some(window) = weak.upgrade() {
+            window.swap();
+            rebuild_chips(&window);
+        }
+    });
+}
+
+/// Language chips for both sides, rebuilt so the most-recently-used order stays
+/// visible and the active language stays highlighted.
+fn rebuild_chips(window: &Rc<Window>) {
+    for strip in [&window.source_chips, &window.target_chips] {
+        while let Some(child) = strip.first_child() {
+            strip.remove(&child);
+        }
+    }
+
+    let (source, target, recent_source, recent_target) = {
+        let settings = window.settings.borrow();
+        (
+            settings.source.clone(),
+            settings.target.clone(),
+            settings.recent_source.clone(),
+            settings.recent_target.clone(),
+        )
+    };
+
+    for (strip, recent, active, is_source) in [
+        (&window.source_chips, recent_source, source, true),
+        (&window.target_chips, recent_target, target, false),
+    ] {
+        for lang in Settings::chips(&recent) {
+            let chip = gtk::Button::with_label(&lang);
+            chip.add_css_class("flat");
+
+            if lang == active {
+                chip.add_css_class("suggested-action");
+            }
+
+            let weak = Rc::downgrade(window);
+            let lang = lang.clone();
+
+            chip.connect_clicked(move |_| {
+                let Some(window) = weak.upgrade() else {
+                    return;
+                };
+
+                window.pick_language(&lang, is_source);
+                rebuild_chips(&window);
+            });
+
+            strip.append(&chip);
+        }
     }
 }
 
@@ -301,12 +424,77 @@ impl Window {
     }
 
     fn show_outcome(&self, outcome: &Outcome) {
+        self.quiet.set(true);
         self.source.buffer().set_text(&outcome.source);
         self.target.buffer().set_text(&outcome.translation);
+        self.quiet.set(false);
+
         self.status
             .set_text(&format!("{} \u{2192} {}", outcome.from, outcome.to));
 
         self.present();
+    }
+
+    fn source_text(&self) -> String {
+        let buffer = self.source.buffer();
+        buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .trim()
+            .to_string()
+    }
+
+    /// Translate whatever is in the source pane, with the current languages.
+    fn retranslate(&self) {
+        let text = self.source_text();
+
+        if !text.is_empty() {
+            self.dispatch(Verb::Text(text));
+        }
+    }
+
+    fn pick_language(&self, lang: &str, is_source: bool) {
+        {
+            let mut settings = self.settings.borrow_mut();
+
+            if is_source {
+                settings.use_source(lang);
+            } else {
+                settings.use_target(lang);
+            }
+
+            if let Err(error) = settings.save() {
+                eprintln!("wl-translate: could not save settings: {error:#}");
+            }
+        }
+
+        self.retranslate();
+    }
+
+    fn swap(&self) {
+        {
+            let mut settings = self.settings.borrow_mut();
+            settings.swap();
+
+            if let Err(error) = settings.save() {
+                eprintln!("wl-translate: could not save settings: {error:#}");
+            }
+        }
+
+        // Swap the panes too, so what you were reading becomes what you are
+        // translating.
+        let target_buffer = self.target.buffer();
+        let translation = target_buffer
+            .text(&target_buffer.start_iter(), &target_buffer.end_iter(), false)
+            .trim()
+            .to_string();
+        let source = self.source_text();
+
+        self.quiet.set(true);
+        self.source.buffer().set_text(&translation);
+        self.target.buffer().set_text(&source);
+        self.quiet.set(false);
+
+        self.retranslate();
     }
 
     fn show_error(&self, error: &str) {
@@ -314,22 +502,4 @@ impl Window {
         self.present();
     }
 
-    /// Language chips, in the most-recently-used order the settings keep.
-    fn rebuild_chips(&self) {
-        while let Some(child) = self.chips.first_child() {
-            self.chips.remove(&child);
-        }
-
-        let settings = self.settings.borrow();
-
-        for lang in Settings::chips(&settings.recent_source) {
-            let chip = gtk::Button::with_label(&lang);
-
-            if lang == settings.source {
-                chip.add_css_class("suggested-action");
-            }
-
-            self.chips.append(&chip);
-        }
-    }
 }
