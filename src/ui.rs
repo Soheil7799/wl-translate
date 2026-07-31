@@ -91,6 +91,50 @@ pub struct State {
 struct Preview {
     png: Vec<u8>,
     handle: image::Handle,
+    /// Window size that shows this capture at roughly life size.
+    window: iced::Size,
+}
+
+/// Width and height straight out of the PNG header.
+///
+/// A PNG is an 8-byte signature followed by the IHDR chunk, whose first two
+/// fields are the dimensions - so this is a read, not a decode. Decoding a
+/// full-screen capture just to learn how big it is would be wasteful.
+fn png_size(png: &[u8]) -> Option<(u32, u32)> {
+    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+    if png.len() < 24 || &png[..8] != SIGNATURE || &png[12..16] != b"IHDR" {
+        return None;
+    }
+
+    let width = u32::from_be_bytes(png[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(png[20..24].try_into().ok()?);
+
+    Some((width, height))
+}
+
+/// Window size for a capture: about as big as what was grabbed, plus room for
+/// the button row, shrunk to fit on screen and floored so a tiny crop still
+/// gives you something you can click.
+fn window_size_for(png: &[u8]) -> iced::Size {
+    // Padding on both sides, and the button row plus its spacing.
+    const CHROME: (f32, f32) = (24.0, 62.0);
+    const MAX: (f32, f32) = (1500.0, 850.0);
+    const MIN: (f32, f32) = (420.0, 260.0);
+
+    let (width, height) = png_size(png).unwrap_or((900, 560));
+    let (mut width, mut height) = (width as f32, height as f32);
+
+    // Shrink oversized captures on both axes at once, so the window keeps the
+    // aspect ratio of the thing it is showing.
+    let scale = (MAX.0 / width).min(MAX.1 / height).min(1.0);
+    width *= scale;
+    height *= scale;
+
+    iced::Size::new(
+        (width + CHROME.0).max(MIN.0),
+        (height + CHROME.1).max(MIN.1),
+    )
 }
 
 impl State {
@@ -196,6 +240,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Shot(png) => {
             state.preview = Some(Preview {
                 handle: image::Handle::from_bytes(png.clone()),
+                window: window_size_for(&png),
                 png,
             });
             show_preview(state)
@@ -368,8 +413,14 @@ fn show_preview(state: &mut State) -> Task<Message> {
         return Task::none();
     }
 
+    let size = state
+        .preview
+        .as_ref()
+        .map(|preview| preview.window)
+        .unwrap_or(iced::Size::new(900.0, 620.0));
+
     let (id, task) = window::open(window::Settings {
-        size: iced::Size::new(900.0, 620.0),
+        size,
         platform_specific: window::settings::PlatformSpecific {
             application_id: "wl-translate".to_string(),
             ..Default::default()
@@ -539,6 +590,50 @@ fn subscription(_state: &State) -> Subscription<Message> {
             iced::keyboard::listen().map(translate_key)
         },
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{png_size, window_size_for};
+
+    /// 1x1 transparent PNG.
+    const TINY: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89,
+    ];
+
+    #[test]
+    fn reads_dimensions_from_the_header() {
+        assert_eq!(png_size(TINY), Some((1, 1)));
+    }
+
+    #[test]
+    fn rejects_things_that_are_not_pngs() {
+        assert_eq!(png_size(b"not a png at all, not even close"), None);
+    }
+
+    #[test]
+    fn a_tiny_crop_still_gets_a_clickable_window() {
+        let size = window_size_for(TINY);
+        assert!(size.width >= 420.0 && size.height >= 260.0);
+    }
+
+    #[test]
+    fn an_oversized_capture_is_shrunk_but_keeps_its_shape() {
+        // Header for a 3840x2160 image.
+        let mut png = TINY.to_vec();
+        png[16..20].copy_from_slice(&3840u32.to_be_bytes());
+        png[20..24].copy_from_slice(&2160u32.to_be_bytes());
+
+        let size = window_size_for(&png);
+
+        assert!(size.width <= 1500.0 + 24.0);
+        assert!(size.height <= 850.0 + 62.0);
+
+        let aspect = (size.width - 24.0) / (size.height - 62.0);
+        assert!((aspect - 3840.0 / 2160.0).abs() < 0.01, "aspect drifted");
+    }
 }
 
 /// While a screenshot is up for review, the keys commit or throw it away.
