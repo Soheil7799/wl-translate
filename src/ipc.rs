@@ -75,10 +75,14 @@ impl Iface {
     }
 }
 
+// These are string literals the macro needs at compile time, so they CANNOT
+// reference SERVICE and PATH above - they have to be kept in step by hand.
+// Changing the constants and not these is exactly how this build ended up
+// sending its screenshots to the GTK daemon, which silently discards them.
 #[zbus::proxy(
     interface = "org.wl_translate.Daemon1",
-    default_service = "org.wl_translate.Daemon",
-    default_path = "/org/wl_translate/Daemon"
+    default_service = "org.wl_translate.Shot",
+    default_path = "/org/wl_translate/Shot"
 )]
 pub trait Daemon {
     async fn ocr(&self) -> zbus::Result<()>;
