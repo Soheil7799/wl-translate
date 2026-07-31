@@ -11,6 +11,7 @@
 //! then has to happen while the freeze is still up, otherwise the region is
 //! taken from a screen that has already moved on.
 
+use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -73,9 +74,40 @@ pub fn interactive(freeze: bool) -> Result<Option<Vec<u8>>> {
 
 /// Ask the user to drag a region. `Ok(None)` means they cancelled (Esc).
 pub fn select_region() -> Result<Option<Region>> {
-    let out = Command::new("slurp")
-        .output()
+    slurp(&[], None)
+}
+
+/// Ask the user to pick one of `boxes` rather than drag freely.
+///
+/// `slurp -r` snaps the selection to whichever predefined box is under the
+/// pointer, which is how window picking works without any compositor-specific
+/// picker: hand it the window rectangles and let it do the highlighting.
+pub fn select_from(boxes: &[String]) -> Result<Option<Region>> {
+    ensure!(!boxes.is_empty(), "nothing on screen to pick");
+    slurp(&["-r"], Some(boxes.join("\n")))
+}
+
+fn slurp(args: &[&str], stdin_boxes: Option<String>) -> Result<Option<Region>> {
+    let mut command = Command::new("slurp");
+    command.args(args).stdout(Stdio::piped());
+
+    if stdin_boxes.is_some() {
+        command.stdin(Stdio::piped());
+    }
+
+    let mut child = command
+        .spawn()
         .context("could not run `slurp` - is it installed?")?;
+
+    if let Some(boxes) = stdin_boxes {
+        child
+            .stdin
+            .as_mut()
+            .context("slurp stdin unavailable")?
+            .write_all(boxes.as_bytes())?;
+    }
+
+    let out = child.wait_with_output()?;
 
     // slurp exits non-zero on cancel, which is not an error for us.
     if !out.status.success() {
@@ -114,16 +146,43 @@ pub fn grab(region: &Region) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// Capture a whole output as PNG. Screenshots want a real image format, unlike
+/// the OCR path where PPM saves an encode/decode round trip nobody sees.
+pub fn grab_output_png(output: &str) -> Result<Vec<u8>> {
+    run_grim(&["-o", output, "-"])
+}
+
+/// Capture one region as PNG.
+pub fn grab_png(region: &Region) -> Result<Vec<u8>> {
+    run_grim(&["-g", region.as_str(), "-"])
+}
+
+fn run_grim(args: &[&str]) -> Result<Vec<u8>> {
+    let out = Command::new("grim")
+        .args(args)
+        .output()
+        .context("could not run `grim` - is it installed?")?;
+
+    ensure!(
+        out.status.success(),
+        "grim failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    ensure!(!out.stdout.is_empty(), "grim produced an empty capture");
+
+    Ok(out.stdout)
+}
+
 /// A held screen, released when dropped.
 ///
 /// Implemented with hyprpicker, which is what grimblast uses for the same job:
 /// it paints a static copy of every output and sits under slurp's selection
 /// surface. `-z` drops its zoom lens and `-d` its colour preview, both of which
 /// would otherwise be painted into the captured image.
-struct Frozen(Child);
+pub struct Frozen(Child);
 
 impl Frozen {
-    fn start() -> Option<Self> {
+    pub fn start() -> Option<Self> {
         let child = Command::new("hyprpicker")
             .args(["-r", "-z", "-d", "-q"])
             .stdout(Stdio::null())

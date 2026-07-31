@@ -14,6 +14,7 @@ mod ipc;
 mod ocr;
 mod pipeline;
 mod settings;
+mod shot;
 mod translate;
 mod ui;
 
@@ -87,6 +88,17 @@ enum Command {
         words: Vec<String>,
     },
 
+    /// Take a screenshot: region, window or screen
+    Shot {
+        /// region | window | screen
+        #[arg(default_value = "region")]
+        mode: String,
+
+        /// Copy to the clipboard only, without writing a file
+        #[arg(long)]
+        no_save: bool,
+    },
+
     /// Raise the daemon's window without changing what is in it
     Show,
 
@@ -103,6 +115,18 @@ fn main() -> Result<()> {
 
     if let Command::Daemon { langs } = &cli.command {
         return ui::run(langs.clone());
+    }
+
+    // Screenshots never involve the daemon: there is no OCR engine to keep warm
+    // and no window to show, so forwarding would only add a hop.
+    if let Command::Shot { mode, no_save } = &cli.command {
+        let settings = Settings::load();
+
+        let Some(taken) = shot::take(mode.parse()?, settings.freeze, !no_save)? else {
+            return Ok(()); // cancelled
+        };
+
+        return report_shot(&taken);
     }
 
     let verb = cli.verb();
@@ -149,7 +173,9 @@ impl Cli {
             Command::Clipboard => Verb::Clipboard,
             Command::Text { words } => Verb::Text(words.join(" ")),
             Command::Show => Verb::Show,
-            Command::Daemon { .. } => Verb::Show,
+            // Both are handled before this point; the arms exist only so the
+            // match stays exhaustive.
+            Command::Shot { .. } | Command::Daemon { .. } => Verb::Show,
         }
     }
 
@@ -189,6 +215,32 @@ fn emit(outcome: &Outcome, cli: &Cli) -> Result<()> {
     if cli.notify || !std::io::stdout().is_terminal() {
         notify(outcome)?;
     }
+    Ok(())
+}
+
+/// Screenshots report where they went. The saved file doubles as the icon, so
+/// the notification carries a thumbnail of what was just captured.
+fn report_shot(taken: &shot::Shot) -> Result<()> {
+    let body = match &taken.saved {
+        Some(path) => path.display().to_string(),
+        None => format!("{} KB on the clipboard", taken.png.len() / 1024),
+    };
+
+    println!("{body}");
+
+    let icon = taken
+        .saved
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "image-x-generic".to_string());
+
+    std::process::Command::new("notify-send")
+        .args(["--app-name", "wl-translate", "--icon", &icon])
+        .arg("Screenshot")
+        .arg(&body)
+        .status()
+        .context("could not run `notify-send`")?;
+
     Ok(())
 }
 
