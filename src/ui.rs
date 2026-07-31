@@ -35,6 +35,8 @@ static LANGS: OnceLock<String> = OnceLock::new();
 enum Event {
     Finished(Outcome),
     Failed(String),
+    /// A frozen output to pick a region out of.
+    Captured(crate::shot::Capture),
 }
 
 /// How long to wait after the last keystroke before re-translating.
@@ -94,12 +96,33 @@ pub fn run(langs: Option<String>) -> Result<()> {
         {
             let window = window.clone();
             let events = event_rx.clone();
+            let app = app.clone();
 
             glib::spawn_future_local(async move {
                 while let Ok(event) = events.recv().await {
                     match event {
                         Event::Finished(outcome) => window.show_outcome(&outcome),
                         Event::Failed(error) => window.show_error(&error),
+
+                        Event::Captured(capture) => {
+                            let window = window.clone();
+
+                            crate::overlay::present(&app, capture, move |done| {
+                                match done {
+                                    // Extract and Translate hand the cropped
+                                    // pixels straight back to the OCR worker;
+                                    // re-dragging a region would be absurd when
+                                    // one has just been selected.
+                                    crate::overlay::Done::Recognise { png, raw } => {
+                                        window.dispatch(Verb::OcrImage { png, raw });
+                                    }
+                                    crate::overlay::Done::Handled(status) => {
+                                        window.note(&status);
+                                    }
+                                    crate::overlay::Done::Cancelled => {}
+                                }
+                            });
+                        }
                     }
                 }
             });
@@ -137,8 +160,8 @@ fn spawn_worker(
         while let Ok(job) = jobs.recv() {
             let event = match worker.run(&job) {
                 Ok(Some(Product::Text(outcome))) => Event::Finished(outcome),
-                // The selection overlay is not ported to GTK yet.
-                Ok(Some(Product::Shot(_))) | Ok(None) => continue,
+                Ok(Some(Product::Shot(capture))) => Event::Captured(capture),
+                Ok(None) => continue,
                 Err(error) => Event::Failed(format!("{error:#}")),
             };
 
@@ -495,6 +518,12 @@ impl Window {
         self.quiet.set(false);
 
         self.retranslate();
+    }
+
+    /// Report something without forcing the window into view - a saved
+    /// screenshot should not drag the translator up in front of you.
+    fn note(&self, status: &str) {
+        self.status.set_text(status);
     }
 
     fn show_error(&self, error: &str) {

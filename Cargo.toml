@@ -18,19 +18,20 @@ leptess = "0.14"
 
 image = { version = "0.25", default-features = false, features = ["png"] }
 
-# Already in the tree as iced's fallback renderer. Used directly to bake
-# annotations into the saved PNG with a real anti-aliased rasteriser, rather
-# than hand-rolling line and arrow drawing over raw pixels.
+# Bakes annotations into the saved PNG with a real anti-aliased rasteriser,
+# rather than hand-rolling line and arrow drawing over raw pixels. Cairo draws
+# the same shapes on screen; tiny-skia draws them into the file.
 tiny-skia = { version = "0.11", features = ["png-format"] }
 
-# D-Bus, on tokio so it shares iced's runtime rather than dragging in async-io.
+# D-Bus. On tokio, served from a thread of its own and handed to the GTK main
+# loop over an async channel.
 zbus = { version = "5.18.0", default-features = false, features = ["tokio"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 serde = { version = "1.0.229", features = ["derive"] }
-# GTK4 for the UI. Pango handles Persian and bidirectional text properly,
-# which is the entire reason this branch exists: iced renders Persian fine
-# but its text inputs mishandle the cursor and selection in right-to-left
-# text, and this app is for editing that text, not just looking at it.
+# GTK4 for the UI, for one reason above all: Pango implements the Unicode
+# bidirectional algorithm and Arabic shaping properly, including caret
+# movement and selection through mixed right-to-left and left-to-right runs.
+# This app exists to edit Persian text, not merely to display it.
 gtk = { version = "0.11", package = "gtk4", features = ["v4_12"] }
 glib = "0.21"
 async-channel = "2.5.0"

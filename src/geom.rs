@@ -1,7 +1,7 @@
 //! Geometry for the selection overlay, independent of any toolkit.
 //!
-//! All of this was written against iced first and is being reused verbatim by
-//! the GTK port. Keeping it free of widget types is what makes that possible:
+//! Kept free of widget types on purpose, which is what let all of it survive a
+//! change of toolkit unchanged:
 //! the rules for what a drag means, where the toolbars can sit and how a
 //! selection maps onto image pixels have nothing to do with which library draws
 //! them, and they are the parts with tests worth keeping.
