@@ -141,6 +141,9 @@ pub fn forward(verb: &Verb) -> Result<bool> {
             Verb::Selection => proxy.selection().await,
             Verb::Clipboard => proxy.clipboard().await,
             Verb::Text(text) => proxy.text(text).await,
+            // Only the overlay produces this, and it already has the daemon it
+            // would be forwarded to.
+            Verb::OcrImage { .. } => return Ok(false),
             Verb::Shot(mode) => proxy.shot(&mode.to_string()).await,
             Verb::Show => proxy.show().await,
         };

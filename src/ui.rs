@@ -52,16 +52,12 @@ pub enum Message {
     /// this the stored id outlives the window and we never open another.
     Closed(window::Id),
     /// A frozen output came back; the overlay picks a region out of it.
-    Shot(shot::Capture),
+    Captured(shot::Capture),
     /// The selection changed while dragging.
     Select(Selection),
     PreviewOpened(window::Id),
-    /// Enter / Space: keep it - save to disk and copy.
-    ShotKeep,
-    /// Ctrl+C: copy only, leave no file behind.
-    ShotCopy,
-    /// Esc: throw it away.
-    ShotDiscard,
+    /// What to do with the selected region. Each has a button and a key.
+    Shot(Commit),
     SourceEdit(text_editor::Action),
     TargetEdit(text_editor::Action),
     PickSource(String),
@@ -85,9 +81,35 @@ pub struct State {
     status: Option<String>,
     /// Bumped on every edit so a stale debounce tick can be ignored.
     generation: u64,
+    /// Set by "extract text", so the recognised text lands on the clipboard as
+    /// well as in the window.
+    copy_when_done: bool,
     /// A frozen output awaiting a selection and a decision.
     overlay: Option<Overlay>,
     overlay_window: Option<window::Id>,
+}
+
+/// What the overlay can do with the region you selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Commit {
+    Copy,
+    Save,
+    Extract,
+    Translate,
+    Close,
+}
+
+impl Commit {
+    /// Label and the key that also triggers it.
+    fn label(self) -> &'static str {
+        match self {
+            Commit::Copy => "Copy  (c)",
+            Commit::Save => "Save  (Enter)",
+            Commit::Extract => "Extract text  (e)",
+            Commit::Translate => "Translate text  (t)",
+            Commit::Close => "Close  (Esc)",
+        }
+    }
 }
 
 /// A frozen output on screen, with whatever is selected out of it.
@@ -95,6 +117,8 @@ struct Overlay {
     capture: shot::Capture,
     handle: image::Handle,
     selection: Option<Selection>,
+    /// Output size in logical points, for deciding where the toolbar goes.
+    screen: Option<iced::Size>,
 }
 
 /// The canvas asks for this so a drag can report itself.
@@ -115,6 +139,7 @@ impl State {
             detected: None,
             status: None,
             generation: 0,
+            copy_when_done: false,
             overlay: None,
             overlay_window: None,
         }
@@ -176,10 +201,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
 
         Message::Finished(outcome) => {
+            if std::mem::take(&mut state.copy_when_done) {
+                let _ = clip::copy(outcome.translation.trim());
+                state.status = Some("copied".into());
+            } else {
+                state.status = None;
+            }
+
             state.source = text_editor::Content::with_text(&outcome.source);
             state.target = text_editor::Content::with_text(&outcome.translation);
             state.detected = Some(outcome.from);
-            state.status = None;
             show(state)
         }
 
@@ -204,7 +235,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             Task::none()
         }
 
-        Message::Shot(capture) => {
+        Message::Captured(capture) => {
             let selection = capture.preset.map(|(x, y, width, height)| {
                 let scale = capture.scale;
                 Selection(iced::Rectangle::new(
@@ -213,10 +244,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 ))
             });
 
+            let screen = shot::png_dimensions(&capture.png).map(|(width, height)| {
+                iced::Size::new(
+                    width as f32 / capture.scale,
+                    height as f32 / capture.scale,
+                )
+            });
+
             state.overlay = Some(Overlay {
                 handle: image::Handle::from_bytes(capture.png.clone()),
                 capture,
                 selection,
+                screen,
             });
 
             show_overlay(state)
@@ -234,9 +273,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             Task::none()
         }
 
-        Message::ShotKeep => commit(state, true),
-        Message::ShotCopy => commit(state, false),
-        Message::ShotDiscard => close_overlay(state),
+        Message::Shot(what) => commit(state, what),
 
         Message::SourceEdit(action) => {
             let changed = action.is_edit();
@@ -370,11 +407,15 @@ fn show(state: &mut State) -> Task<Message> {
     task.map(Message::Opened)
 }
 
-/// Crop what is selected out of the frozen output, then commit it.
+/// Crop what is selected out of the frozen output, then act on it.
 ///
-/// `save` decides between "save and copy" and "copy only" - the whole point of
-/// the overlay is that this is chosen after seeing the selection, not before.
-fn commit(state: &mut State, save: bool) -> Task<Message> {
+/// Nothing has touched the clipboard or the disk until this runs - that is the
+/// whole point of the overlay.
+fn commit(state: &mut State, what: Commit) -> Task<Message> {
+    if what == Commit::Close {
+        return close_overlay(state);
+    }
+
     let Some(overlay) = &state.overlay else {
         return close_overlay(state);
     };
@@ -388,31 +429,63 @@ fn commit(state: &mut State, save: bool) -> Task<Message> {
         .map(|(width, height)| iced::Size::new(width, height))
         .unwrap_or(iced::Size::new(0, 0));
 
-    let outcome = overlay
+    let Some(cropped) = overlay
         .selection
         .and_then(|selection| selection.to_pixels(overlay.capture.scale, image))
-        .map(|(x, y, width, height)| {
-            let cropped = shot::crop(&overlay.capture.png, x, y, width, height)?;
-            shot::copy_image(&cropped)?;
-
-            if save {
-                shot::save(&cropped).map(Some)
-            } else {
-                Ok(None)
-            }
-        });
-
-    state.status = match outcome {
-        Some(Ok(Some(path))) => Some(format!("saved {}", path.display())),
-        Some(Ok(None)) => Some("copied".into()),
-        Some(Err(error)) => Some(format!("{error:#}")),
-        None => Some("nothing selected".into()),
+        .map(|(x, y, width, height)| shot::crop(&overlay.capture.png, x, y, width, height))
+    else {
+        state.status = Some("nothing selected".into());
+        return Task::none();
     };
+
+    let cropped = match cropped {
+        Ok(cropped) => cropped,
+        Err(error) => {
+            state.status = Some(format!("{error:#}"));
+            return close_overlay(state);
+        }
+    };
+
+    match what {
+        Commit::Copy => {
+            state.status = match shot::copy_image(&cropped) {
+                Ok(()) => Some("copied".into()),
+                Err(error) => Some(format!("{error:#}")),
+            };
+        }
+
+        Commit::Save => {
+            let _ = shot::copy_image(&cropped);
+
+            state.status = match shot::save(&cropped) {
+                Ok(path) => Some(format!("saved {}", path.display())),
+                Err(error) => Some(format!("{error:#}")),
+            };
+        }
+
+        // Both hand the pixels straight to the OCR worker. Re-dragging a region
+        // would be absurd when one has just been selected.
+        Commit::Extract | Commit::Translate => {
+            state.copy_when_done = what == Commit::Extract;
+
+            let verb = Verb::OcrImage {
+                png: cropped,
+                raw: what == Commit::Extract,
+            };
+
+            let dispatched = dispatch(state, verb);
+            let closed = close_overlay(state);
+
+            return Task::batch([dispatched, closed]);
+        }
+
+        Commit::Close => unreachable!("handled above"),
+    }
 
     close_overlay(state)
 }
 
-/// Fullscreen and undecorated, so the frozen capture lines up pixel for pixel
+/// Fullscreen and undecorated/// Fullscreen and undecorated, so the frozen capture lines up pixel for pixel
 /// with the screen it was taken from.
 fn show_overlay(state: &mut State) -> Task<Message> {
     if state.overlay_window.is_some() {
@@ -470,6 +543,44 @@ fn close_overlay(state: &mut State) -> Task<Message> {
     }
 }
 
+/// Height of the toolbar strip, used both to lay it out and to decide which
+/// screen edge it can sit on without covering the selection.
+const TOOLBAR: f32 = 72.0;
+
+/// The action buttons, stuck to whichever screen edge the selection leaves
+/// clear. They do not follow the selection around - they only get out of its
+/// way.
+fn toolbar(overlay: &Overlay) -> Element<'_, Message> {
+    let screen = overlay
+        .screen
+        .unwrap_or(iced::Size::new(1920.0, 1080.0));
+
+    let anchor = overlay::toolbar_anchor(overlay.selection, screen, TOOLBAR);
+
+    let buttons = [
+        Commit::Copy,
+        Commit::Save,
+        Commit::Extract,
+        Commit::Translate,
+        Commit::Close,
+    ]
+    .into_iter()
+    .fold(row![].spacing(8), |strip, action| {
+        strip.push(button(text(action.label()).size(12)).on_press(Message::Shot(action)))
+    });
+
+    container(buttons)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Center)
+        .align_y(match anchor {
+            overlay::Anchor::Top => Alignment::Start,
+            overlay::Anchor::Bottom => Alignment::End,
+        })
+        .padding(20)
+        .into()
+}
+
 fn view(state: &State, window_id: window::Id) -> Element<'_, Message> {
     if state.overlay_window == Some(window_id) {
         if let Some(overlay) = &state.overlay {
@@ -490,6 +601,7 @@ fn view(state: &State, window_id: window::Id) -> Element<'_, Message> {
                     .width(Length::Fill)
                     .height(Length::Fill),
                 )
+                .push(toolbar(overlay))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into();
@@ -614,27 +726,27 @@ fn subscription(_state: &State) -> Subscription<Message> {
     ])
 }
 
-/// While a screenshot is up for review, the keys commit or throw it away.
+/// While the overlay is up, every toolbar button also has a key.
 fn review_key(event: iced::keyboard::Event) -> Message {
     use iced::keyboard::key::Named;
     use iced::keyboard::{Event, Key};
 
-    match event {
-        Event::KeyPressed {
-            key: Key::Named(Named::Enter | Named::Space),
-            ..
-        } => Message::ShotKeep,
-        Event::KeyPressed {
-            key: Key::Character(character),
-            modifiers,
-            ..
-        } if modifiers.control() && character.as_str().eq_ignore_ascii_case("c") => {
-            Message::ShotCopy
-        }
-        Event::KeyPressed {
-            key: Key::Named(Named::Escape),
-            ..
-        } => Message::ShotDiscard,
+    let Event::KeyPressed { key, modifiers, .. } = event else {
+        return Message::Ignore;
+    };
+
+    match key {
+        Key::Named(Named::Enter | Named::Space) => Message::Shot(Commit::Save),
+        Key::Named(Named::Escape) => Message::Shot(Commit::Close),
+        Key::Character(character) => match character.as_str() {
+            // Ctrl+C as well as plain c, since one is muscle memory and the
+            // other is what the button says.
+            "c" => Message::Shot(Commit::Copy),
+            "s" if !modifiers.control() => Message::Shot(Commit::Save),
+            "e" => Message::Shot(Commit::Extract),
+            "t" => Message::Shot(Commit::Translate),
+            _ => Message::Ignore,
+        },
         _ => Message::Ignore,
     }
 }
@@ -709,7 +821,7 @@ fn events() -> impl Stream<Item = Message> {
                 Some(verb) = trigger_rx.recv() => Message::Trigger(verb),
                 Some(result) = out_rx.recv() => match result {
                     Ok(Some(Product::Text(outcome))) => Message::Finished(outcome),
-                    Ok(Some(Product::Shot(png))) => Message::Shot(png),
+                    Ok(Some(Product::Shot(capture))) => Message::Captured(capture),
                     Ok(None) => continue, // cancelled drag, or a UI-only verb
                     Err(error) => Message::Failed(error),
                 },

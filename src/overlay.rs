@@ -157,18 +157,9 @@ where
             None => frame.fill_rectangle(full.position(), full.size(), dim),
         }
 
-        // Drawn inside the canvas rather than in a bar beside it: the canvas
-        // has to fill the window exactly, or the image would be scaled to a
-        // smaller area and every selection coordinate would be wrong.
-        frame.fill_text(canvas::Text {
-            content: "drag to select   ·   Enter save + copy   ·   Ctrl+C copy   ·   Esc cancel"
-                .to_string(),
-            position: Point::new(bounds.width / 2.0, bounds.height - 28.0),
-            color: Color::from_rgba(1.0, 1.0, 1.0, 0.85),
-            size: 14.0.into(),
-            align_x: iced::alignment::Horizontal::Center.into(),
-            ..canvas::Text::default()
-        });
+        // No hint line here any more: the toolbar spells out every action and
+        // its key, and the two disagreed with each other as soon as the buttons
+        // gained their own shortcuts.
 
         vec![frame.into_geometry()]
     }
@@ -304,6 +295,53 @@ fn surround(full: Rectangle, hole: Rectangle) -> Vec<Rectangle> {
     .collect()
 }
 
+/// Which screen edge the toolbar sits against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Anchor {
+    Top,
+    Bottom,
+}
+
+/// Pick the screen edge that the selection covers least.
+///
+/// The toolbar sticks to the *screen*, not to the selection - it does not
+/// follow the box around. All it does is move out of the way, so it never sits
+/// on top of what you are trying to look at.
+///
+/// Bottom is preferred because that is where the hint line already is; it flips
+/// to the top only when the selection reaches into the bottom strip. A
+/// selection tall enough to cover both gets whichever it overlaps less.
+pub fn toolbar_anchor(selection: Option<Selection>, screen: Size, bar: f32) -> Anchor {
+    let Some(rect) = selection.map(|selection| selection.0) else {
+        return Anchor::Bottom;
+    };
+
+    let top = Rectangle::new(Point::ORIGIN, Size::new(screen.width, bar));
+    let bottom = Rectangle::new(
+        Point::new(0.0, (screen.height - bar).max(0.0)),
+        Size::new(screen.width, bar),
+    );
+
+    match (overlap(rect, bottom), overlap(rect, top)) {
+        (0.0, _) => Anchor::Bottom,
+        (_, 0.0) => Anchor::Top,
+        (in_bottom, in_top) if in_top < in_bottom => Anchor::Top,
+        _ => Anchor::Bottom,
+    }
+}
+
+/// Area shared by two rectangles.
+fn overlap(a: Rectangle, b: Rectangle) -> f32 {
+    let width = (a.x + a.width).min(b.x + b.width) - a.x.max(b.x);
+    let height = (a.y + a.height).min(b.y + b.height) - a.y.max(b.y);
+
+    if width <= 0.0 || height <= 0.0 {
+        0.0
+    } else {
+        width * height
+    }
+}
+
 /// Whether a selection is big enough to be a deliberate drag rather than a
 /// stray click.
 pub fn is_usable(selection: Option<Selection>) -> bool {
@@ -364,6 +402,44 @@ mod tests {
             .expect("non-empty");
 
         assert_eq!((x, w), (90, 10));
+    }
+
+    const SCREEN: Size = Size {
+        width: 1920.0,
+        height: 1080.0,
+    };
+    const BAR: f32 = 60.0;
+
+    fn at(x: f32, y: f32, w: f32, h: f32) -> Option<Selection> {
+        Some(Selection(Rectangle::new(
+            Point::new(x, y),
+            Size::new(w, h),
+        )))
+    }
+
+    #[test]
+    fn the_toolbar_sits_at_the_bottom_when_nothing_is_in_the_way() {
+        assert_eq!(toolbar_anchor(None, SCREEN, BAR), Anchor::Bottom);
+        assert_eq!(
+            toolbar_anchor(at(100.0, 100.0, 400.0, 300.0), SCREEN, BAR),
+            Anchor::Bottom
+        );
+    }
+
+    #[test]
+    fn it_moves_to_the_top_when_the_selection_reaches_the_bottom() {
+        assert_eq!(
+            toolbar_anchor(at(100.0, 900.0, 400.0, 180.0), SCREEN, BAR),
+            Anchor::Top
+        );
+    }
+
+    #[test]
+    fn a_selection_covering_both_edges_takes_the_one_it_covers_least() {
+        // Full height, but only clipping a sliver of the top strip.
+        let selection = at(0.0, 40.0, 400.0, 1040.0);
+
+        assert_eq!(toolbar_anchor(selection, SCREEN, BAR), Anchor::Top);
     }
 
     #[test]

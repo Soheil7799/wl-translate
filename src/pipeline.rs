@@ -25,6 +25,14 @@ pub enum Verb {
     /// Take a screenshot. The bytes come back for review rather than being
     /// written straight out, so the keypress decides what happens to them.
     Shot(shot::Mode),
+    /// Read an image we already hold, rather than capturing a new one. This is
+    /// what the overlay's "extract text" and "translate text" run: the pixels
+    /// are already selected, so re-dragging a region would be absurd.
+    OcrImage {
+        png: Vec<u8>,
+        /// Extract only, no translation.
+        raw: bool,
+    },
     /// Raise the window without changing its contents. Handled by the UI, never
     /// reaches the worker.
     Show,
@@ -32,7 +40,7 @@ pub enum Verb {
 
 impl Verb {
     pub fn is_raw(&self) -> bool {
-        matches!(self, Verb::OcrRaw)
+        matches!(self, Verb::OcrRaw | Verb::OcrImage { raw: true, .. })
     }
 }
 
@@ -132,6 +140,7 @@ impl Worker {
             Verb::Text(text) => Some(text.clone()),
             Verb::Selection => Some(crate::clip::primary()?),
             Verb::Clipboard => Some(crate::clip::clipboard()?),
+            Verb::OcrImage { png, .. } => Some(self.engine()?.recognize(png)?),
             Verb::OcrRaw => self.capture_text(None, job.freeze)?,
             Verb::Ocr { geometry } => self.capture_text(geometry.as_deref(), job.freeze)?,
         })
