@@ -34,6 +34,11 @@ struct Cli {
     /// Put the result on the clipboard as well as stdout
     #[arg(short, long, global = true)]
     copy: bool,
+
+    /// Show the result as a desktop notification. Bound to a key there is no
+    /// terminal to print to, so this is what makes the keybinds usable.
+    #[arg(short, long, global = true)]
+    notify: bool,
 }
 
 #[derive(Subcommand)]
@@ -89,7 +94,7 @@ fn main() -> Result<()> {
             anyhow::ensure!(!text.is_empty(), "no text found in that region");
 
             if *raw {
-                emit(&text, None, cli.copy)?;
+                emit(&text, None, &cli)?;
                 return Ok(());
             }
             let out = translate(&cli, &text)?;
@@ -117,7 +122,7 @@ fn main() -> Result<()> {
         }
     };
 
-    emit(&translated, Some(&source), cli.copy)
+    emit(&translated, Some(&source), &cli)
 }
 
 fn translate(cli: &Cli, text: &str) -> Result<String> {
@@ -134,16 +139,62 @@ fn translate(cli: &Cli, text: &str) -> Result<String> {
     Ok(result.text)
 }
 
-/// Print the result, and optionally put it on the clipboard. Source text goes to
-/// stderr so `wl-translate ocr | some-tool` pipes only the translation.
-fn emit(result: &str, source: Option<&str>, copy: bool) -> Result<()> {
+/// Print the result, and optionally copy/notify. Source text goes to stderr so
+/// `wl-translate ocr | some-tool` pipes only the translation.
+fn emit(result: &str, source: Option<&str>, cli: &Cli) -> Result<()> {
     if let Some(src) = source {
         eprintln!("--- source ---\n{src}\n--- translation ---");
     }
     println!("{result}");
 
-    if copy {
+    if cli.copy {
         clip::copy(result)?;
     }
+    if cli.notify {
+        notify(result, source)?;
+    }
     Ok(())
+}
+
+/// Summary line for the notification title: the source text, collapsed to one
+/// line and clipped, so a paragraph does not produce a wall of a notification.
+fn summarize(text: &str, max: usize) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match one_line.char_indices().nth(max) {
+        Some((byte_idx, _)) => format!("{}...", &one_line[..byte_idx].trim_end()),
+        None => one_line,
+    }
+}
+
+fn notify(result: &str, source: Option<&str>) -> Result<()> {
+    let title = match source {
+        Some(src) => summarize(src, 60),
+        None => "Extracted text".to_string(),
+    };
+
+    std::process::Command::new("notify-send")
+        .args(["--app-name", "wl-translate", "--icon", "accessories-dictionary"])
+        .arg(&title)
+        .arg(result)
+        .status()
+        .context("could not run `notify-send`")?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize;
+
+    #[test]
+    fn collapses_whitespace_and_clips() {
+        assert_eq!(summarize("one   two\nthree", 40), "one two three");
+        assert_eq!(summarize("abcdefghij", 4), "abcd...");
+    }
+
+    #[test]
+    fn clips_on_char_boundaries_not_bytes() {
+        // Persian is multi-byte; slicing by byte index here would panic.
+        assert_eq!(summarize("سلام حال شما چطور است", 4), "سلام...");
+    }
 }

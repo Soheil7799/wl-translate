@@ -47,17 +47,22 @@ wl-translate text --to en "ciao"    # translate an argument
 # useful flags
 --from it      # skip language detection
 --copy         # also put the result on the clipboard
+--notify       # show the result as a desktop notification
 --engine ai    # use an LLM instead of Google
+--geometry "X,Y WxH"   # OCR a fixed region instead of dragging one
 ```
+
+Bound to a key there is no terminal to print to, so use `--notify --copy`.
 
 ### Keybinds
 
 Hyprland:
 
 ```
-bind = SUPER, T, exec, wl-translate selection --to en --copy
-bind = SUPER SHIFT, T, exec, wl-translate ocr --to en --copy
-bind = SUPER ALT, T, exec, wl-translate ocr --raw --copy
+bind = SUPER CTRL, T,     exec, wl-translate selection --to en --copy --notify
+bind = SUPER ALT, T,      exec, wl-translate clipboard --to en --copy --notify
+bind = SUPER, Print,      exec, wl-translate ocr --to en --copy --notify
+bind = SUPER SHIFT, Print, exec, wl-translate ocr --raw --copy --notify
 ```
 
 KDE, niri, sway and anything else: bind the same commands. That is the whole
