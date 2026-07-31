@@ -38,6 +38,8 @@ pub struct Job {
     pub from: String,
     pub to: String,
     pub engine: String,
+    /// Hold the screen still while a region is dragged.
+    pub freeze: bool,
 }
 
 impl Job {
@@ -47,6 +49,7 @@ impl Job {
             from: "auto".into(),
             to: "en".into(),
             engine: "google".into(),
+            freeze: true,
         }
     }
 }
@@ -110,21 +113,21 @@ impl Worker {
             Verb::Text(text) => Some(text.clone()),
             Verb::Selection => Some(crate::clip::primary()?),
             Verb::Clipboard => Some(crate::clip::clipboard()?),
-            Verb::OcrRaw => self.capture_text(None)?,
-            Verb::Ocr { geometry } => self.capture_text(geometry.as_deref())?,
+            Verb::OcrRaw => self.capture_text(None, job.freeze)?,
+            Verb::Ocr { geometry } => self.capture_text(geometry.as_deref(), job.freeze)?,
         })
     }
 
-    fn capture_text(&mut self, geometry: Option<&str>) -> Result<Option<String>> {
-        let region = match geometry {
-            Some(spec) => capture::Region::parse(spec)?,
-            None => match capture::select_region()? {
-                Some(region) => region,
+    fn capture_text(&mut self, geometry: Option<&str>, freeze: bool) -> Result<Option<String>> {
+        // A geometry given up front needs no drag, so nothing to hold still.
+        let image = match geometry {
+            Some(spec) => capture::grab(&capture::Region::parse(spec)?)?,
+            None => match capture::interactive(freeze)? {
+                Some(image) => image,
                 None => return Ok(None),
             },
         };
 
-        let image = capture::grab(&region)?;
         Ok(Some(self.engine()?.recognize(&image)?))
     }
 

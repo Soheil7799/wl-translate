@@ -242,6 +242,7 @@ fn dispatch(state: &State, verb: Verb) -> Task<Message> {
         job.from = state.settings.source.clone();
         job.to = state.settings.effective_target();
         job.engine = state.settings.engine.clone();
+        job.freeze = state.settings.freeze;
 
         let _ = sender.send(job);
     }
@@ -316,15 +317,31 @@ fn view(state: &State, _window: window::Id) -> Element<'_, Message> {
     .spacing(8)
     .align_y(Alignment::Center);
 
+    // clip(true) contains a cosmic-text bidi bug: a line that mixes Latin into
+    // right-to-left text (a Persian sentence containing "OCR", say) is wrapped
+    // on the logical string and only then reordered visually, so the drawn line
+    // comes out wider than the width it was wrapped to and bleeds past the left
+    // edge into the neighbouring pane. Pure-Persian lines are fine. Clipping
+    // keeps it inside its own box; the real fix belongs upstream.
     let panes = row![
-        text_editor(&state.source)
-            .on_action(Message::SourceEdit)
-            .placeholder("Nothing captured yet")
-            .height(Length::Fill),
-        text_editor(&state.target)
-            .on_action(Message::TargetEdit)
-            .placeholder("Translation")
-            .height(Length::Fill),
+        container(
+            text_editor(&state.source)
+                .on_action(Message::SourceEdit)
+                .placeholder("Nothing captured yet")
+                .height(Length::Fill)
+        )
+        .width(Length::FillPortion(1))
+        .height(Length::Fill)
+        .clip(true),
+        container(
+            text_editor(&state.target)
+                .on_action(Message::TargetEdit)
+                .placeholder("Translation")
+                .height(Length::Fill)
+        )
+        .width(Length::FillPortion(1))
+        .height(Length::Fill)
+        .clip(true),
     ]
     .spacing(10)
     .height(Length::Fill);

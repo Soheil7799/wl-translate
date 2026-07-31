@@ -126,6 +126,7 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| settings.effective_target());
     job.engine = cli.engine.clone().unwrap_or_else(|| settings.engine.clone());
+    job.freeze = settings.freeze;
 
     let Some(outcome) = Worker::new(settings.langs.clone()).run(&job)? else {
         return Ok(()); // user cancelled the region drag

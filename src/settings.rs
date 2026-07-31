@@ -25,6 +25,9 @@ pub struct Settings {
     pub engine: String,
     /// Tesseract languages, "+"-joined.
     pub langs: String,
+    /// Hold the screen still while dragging an OCR region, so a video or a
+    /// scrolling page cannot move out from under the selection.
+    pub freeze: bool,
 }
 
 impl Default for Settings {
@@ -36,6 +39,7 @@ impl Default for Settings {
             recent_target: vec!["en".into(), "fa".into(), "it".into()],
             engine: "google".into(),
             langs: "eng+ita+fas".into(),
+            freeze: true,
         }
     }
 }

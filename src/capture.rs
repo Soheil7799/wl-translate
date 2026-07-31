@@ -1,11 +1,20 @@
 //! Screen capture.
 //!
-//! Deliberately two steps: select the region FIRST, then grab only that region.
-//! Grabbing the whole desktop and cropping afterwards costs ~420ms on a
-//! multi-monitor setup because of PNG encoding; a region grab to PPM is ~42ms.
+//! Two shapes, for two different reasons.
+//!
+//! Unfrozen: select the region FIRST, then grab only that region. Grabbing the
+//! whole desktop and cropping afterwards costs ~420ms on a multi-monitor setup
+//! because of PNG encoding; a region grab to PPM is ~42ms.
+//!
+//! Frozen: the screen is held still while you drag, so a video, a scrolling
+//! page or a hover tooltip cannot move out from under the selection. The grab
+//! then has to happen while the freeze is still up, otherwise the region is
+//! taken from a screen that has already moved on.
+
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
-use std::process::Command;
 
 /// A region in compositor output space, in slurp's own `X,Y WxH` notation.
 /// Kept as an opaque string so it round-trips to grim without reformatting.
@@ -40,6 +49,26 @@ impl Region {
 
         Ok(Region(spec.to_string()))
     }
+}
+
+/// Drag a region and capture it. `Ok(None)` means the drag was cancelled.
+///
+/// When `freeze` is set the screen is held still for the duration, and the grab
+/// happens before it is released - so what you selected is what you get, even
+/// if the underlying window was playing a video.
+pub fn interactive(freeze: bool) -> Result<Option<Vec<u8>>> {
+    let frozen = if freeze { Frozen::start() } else { None };
+
+    let Some(region) = select_region()? else {
+        return Ok(None);
+    };
+
+    // Still inside the freeze: grim reads what is on screen, which is the held
+    // image. Dropping `frozen` after this is what releases it.
+    let image = grab(&region);
+    drop(frozen);
+
+    image.map(Some)
 }
 
 /// Ask the user to drag a region. `Ok(None)` means they cancelled (Esc).
@@ -83,4 +112,36 @@ pub fn grab(region: &Region) -> Result<Vec<u8>> {
     ensure!(!out.stdout.is_empty(), "grim produced an empty capture");
 
     Ok(out.stdout)
+}
+
+/// A held screen, released when dropped.
+///
+/// Implemented with hyprpicker, which is what grimblast uses for the same job:
+/// it paints a static copy of every output and sits under slurp's selection
+/// surface. `-z` drops its zoom lens and `-d` its colour preview, both of which
+/// would otherwise be painted into the captured image.
+struct Frozen(Child);
+
+impl Frozen {
+    fn start() -> Option<Self> {
+        let child = Command::new("hyprpicker")
+            .args(["-r", "-z", "-d", "-q"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+
+        // The frozen surface needs to be mapped before slurp draws over it.
+        // Racing it shows the live screen for the first frames of the drag.
+        std::thread::sleep(Duration::from_millis(200));
+
+        Some(Self(child))
+    }
+}
+
+impl Drop for Frozen {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
