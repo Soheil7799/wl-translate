@@ -58,6 +58,8 @@ enum Drag {
     New { origin: Point },
     Move { offset: (f64, f64) },
     Resize { anchor: Point },
+    /// Dragging one side; the other three stay where they are.
+    ResizeEdge { edge: geom::Edge, from: Rect },
     Draw,
 }
 
@@ -309,15 +311,21 @@ fn wire_pointer(
                 state.drawing = Some(annotation);
                 state.drag = Some(Drag::Draw);
             } else {
+                // Corners before edges: inside a corner's grab radius two
+                // edges are also in range, and resizing one axis when you aimed
+                // at a corner feels broken.
                 state.drag = Some(match state.selection {
                     Some(rect) => match geom::nearest_corner(rect, at) {
                         Some(corner) => Drag::Resize {
                             anchor: geom::opposite(rect, corner),
                         },
-                        None if rect.contains(at) => Drag::Move {
-                            offset: (at.x - rect.x, at.y - rect.y),
+                        None => match geom::nearest_edge(rect, at) {
+                            Some(edge) => Drag::ResizeEdge { edge, from: rect },
+                            None if rect.contains(at) => Drag::Move {
+                                offset: (at.x - rect.x, at.y - rect.y),
+                            },
+                            None => Drag::New { origin: at },
                         },
-                        None => Drag::New { origin: at },
                     },
                     None => Drag::New { origin: at },
                 });
@@ -352,6 +360,9 @@ fn wire_pointer(
                 }
                 Some(Drag::Resize { anchor }) => {
                     state.selection = Some(geom::from_corners(anchor, at));
+                }
+                Some(Drag::ResizeEdge { edge, from }) => {
+                    state.selection = Some(geom::resize_edge(from, edge, at));
                 }
                 Some(Drag::Move { offset }) => {
                     if let Some(rect) = state.selection {
@@ -426,8 +437,12 @@ fn wire_pointer(
                         Some(geom::Corner::TopRight) | Some(geom::Corner::BottomLeft) => {
                             "nesw-resize"
                         }
-                        None if rect.contains(at) => "move",
-                        None => "crosshair",
+                        None => match geom::nearest_edge(rect, at) {
+                            Some(geom::Edge::Top) | Some(geom::Edge::Bottom) => "ns-resize",
+                            Some(geom::Edge::Left) | Some(geom::Edge::Right) => "ew-resize",
+                            None if rect.contains(at) => "move",
+                            None => "crosshair",
+                        },
                     },
                     None => "crosshair",
                 }

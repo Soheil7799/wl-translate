@@ -1,39 +1,59 @@
 # wl-translate
 
-On-screen OCR and translation for Wayland.
+On-screen OCR, translation and screenshots for Wayland.
 
-Select a region of the screen, read the text in it, translate it. Or translate
-whatever you have highlighted with the mouse. Bound to whatever keys your
-compositor uses.
+Read text off the screen and translate it, translate what you have highlighted,
+or take an annotated screenshot. Bound to whatever keys your compositor uses.
 
 ## Why
 
-Wayland gives no application global hotkeys, and gives a background process no
-way to read the selection through a toolkit clipboard API. Most translator apps
-were built on X11 assumptions and quietly stopped working:
+Wayland gives an application no global hotkeys, and gives a background process
+no way to read the selection through a toolkit clipboard API. Most translator
+apps were built on X11 assumptions and quietly stopped working — including Crow
+Translate, whose shortcut settings use `QHotkey`, which is X11-only and silently
+does nothing.
 
-- `QHotkey` and friends are X11-only, so in-app shortcut settings silently no-op.
-- A toolkit's clipboard read needs keyboard focus, which a tray daemon does not
-  have.
+`wl-translate` inverts both:
 
-`wl-translate` inverts both. The **compositor owns the keybinding** and this
-program is just a set of verbs you bind. Selection reads go through
-`wl-clipboard`, which uses the `wlr-data-control` protocol and works without
-focus. Switch from Hyprland to KWin to niri and you rewrite one line of keybind
-config; nothing in this program changes.
+- **The compositor owns the keybinding.** This program is a set of verbs you
+  bind. Switch from Hyprland to KWin to niri and you rewrite one line of keybind
+  config; nothing here changes.
+- **Selection reads go through `wl-clipboard`**, which uses the
+  `wlr-data-control` protocol and works without keyboard focus. A toolkit
+  clipboard API cannot — that is the wall Crow hits.
+
+It is GTK4 for one reason above all: Pango implements the Unicode bidirectional
+algorithm and Arabic shaping properly, *including caret movement and selection
+through mixed right-to-left and left-to-right runs*. This window exists to edit
+Persian, not merely to display it.
 
 ## Install
 
-Requires `slurp`, `grim`, `wl-clipboard`, and `tesseract` with the language data
-you want:
-
 ```sh
-sudo pacman -S slurp grim wl-clipboard tesseract \
-               tesseract-data-eng tesseract-data-ita tesseract-data-fas
+sudo pacman -S gtk4 slurp grim wl-clipboard tesseract hyprpicker
 
 cargo build --release
 install -Dm755 target/release/wl-translate ~/.local/bin/wl-translate
 ```
+
+`hyprpicker` is optional and only used to freeze the screen for the OCR region
+drag. Screenshots freeze by capturing up front and need nothing extra.
+
+### Language models
+
+Distributions ship the legacy tessdata. The Persian model in `tessdata_best` is
+six times the size and reads screen-resolution Persian far better:
+
+```sh
+mkdir -p ~/.local/share/tessdata && cd ~/.local/share/tessdata
+curl -LO https://github.com/tesseract-ocr/tessdata_best/raw/main/fas.traineddata
+curl -LO https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata
+curl -LO https://github.com/tesseract-ocr/tessdata_fast/raw/main/ita.traineddata
+```
+
+`best` for the language that needs it, `fast` for the ones that do not — `best`
+everywhere costs several hundred megabytes of resident memory for no accuracy
+you would notice. Then set `tessdata` in the config below.
 
 ## Usage
 
@@ -44,55 +64,28 @@ what you are translating into.
 ```sh
 wl-translate selection     # translate the current mouse selection
 wl-translate clipboard     # translate the clipboard
-wl-translate ocr           # drag a region, OCR it, translate
+wl-translate ocr           # drag a region, read it, translate it
 wl-translate ocr --raw     # drag a region, just extract the text
 wl-translate text "ciao"   # translate an argument
 wl-translate show          # raise the window as it is
 
-wl-translate shot          # drag a region and review it
-wl-translate shot window   # pick a window
-wl-translate shot screen   # the focused output
+wl-translate shot          # screenshot: drag a region
+wl-translate shot window   # the focused window, still adjustable
+wl-translate shot screen   # the focused output, still adjustable
+
+wl-translate daemon        # run resident (see below)
 ```
 
-## Screenshots
+Flags exist for scripting and are never needed day to day: `--to`, `--from` and
+`--engine` override the saved settings for one run, `--geometry "X,Y WxH"` skips
+the drag, `--no-daemon` does the work in the calling process.
 
-The screen is captured up front and shown back to you fullscreen, so nothing is
-live any more: a video, a scrolling page or a hover tooltip cannot move out from
-under the selection. Drag a region on that frozen copy, adjust it by its corners
-or drag it around, and nothing is committed until you say so:
+## The daemon
 
-| key | does |
-|---|---|
-| `Enter` / `Space` | save to disk **and** copy |
-| `Ctrl+C` | copy only, no file |
-| `Esc` | discard |
+Everything is handled by a resident daemon. Verbs hand their work to it and it
+starts one if none is running, so a keybind behaves the same either way.
 
-Files land in `<pictures>/Screenshots/Screenshot_<timestamp>.png`.
-
-With no daemon running there is no window to review in, so a shot copies and
-saves immediately instead.
-
-Flags exist for scripting and are never needed day to day:
-
-```sh
---to fa --from it      # override the saved languages for one run
---engine ai            # use an LLM instead of Google
---geometry "X,Y WxH"   # OCR a fixed region instead of dragging one
---copy --notify        # clipboard and notification, for running without a daemon
---no-daemon            # do the work here even if a daemon is running
-```
-
-## Daemon
-
-```sh
-wl-translate daemon
-```
-
-Runs resident with the tesseract language models loaded and shows results in a
-window. Every verb hands its work to the daemon when one is running, so the same
-keybinds get faster and gain a UI with nothing to change.
-
-It exposes the verbs on D-Bus, so a compositor can trigger it without this
+It exposes the verbs on D-Bus, so a compositor can drive it without this
 program's CLI in the loop at all:
 
 ```sh
@@ -103,24 +96,76 @@ busctl --user call org.wl_translate.Daemon /org/wl_translate/Daemon \
 That call returns in ~8ms — a keybind never waits for OCR.
 
 Methods, none of which take a language: `Ocr()`, `OcrRaw()`, `Selection()`,
-`Clipboard()`, `Text(s text)`, `Show()`.
+`Clipboard()`, `Text(s)`, `Shot(s mode)`, `Show()`.
 
-### The window
+Run it under systemd so it comes back if it dies:
+
+```sh
+systemctl --user enable --now wl-translate.service
+```
+
+It idles at about 6MB. Tesseract's models are loaded on first use and dropped
+again after three minutes, so the memory is only held while you are using it.
+
+## The window
 
 Modelled on Crow Translate: a row of language chips per side with `auto` first
-and the rest ordered most-recently-used, a swap button between them, and two
-editable panes.
+and the rest most-recently-used, a swap button between them, and two editable
+panes.
 
-- Clicking a chip re-translates the current text immediately.
-- Editing the source re-translates after a 350ms pause.
-- The translation pane is editable too, so you can adjust wording before
-  copying; editing it triggers nothing.
+- Clicking a chip re-translates immediately; `⋯` opens the full language list.
+- Editing the source re-translates after a 350ms pause. Editing the translation
+  triggers nothing, so it is a place to adjust wording before copying.
+- The clock icon lists recent translations; click one to bring it back.
 - `auto` on the source side means "detect it". On the target side there is
-  nothing to detect, so it means your system language, taken from the locale.
-- Right-to-left text aligns right and left-to-right aligns left, handled by
-  cosmic-text without any special casing.
+  nothing to detect, so it means your system language.
+- `Esc` closes it.
 
-## Settings
+Right-to-left text lays out right-to-left, in the same buffer as left-to-right
+text, with the caret behaving correctly in both. That is Pango, and it costs no
+code here at all.
+
+## Screenshots
+
+The screen is captured up front and shown back fullscreen, so nothing is live:
+a video, a scrolling page or a hover tooltip cannot move out from under the
+selection. Drag a region on that frozen copy, adjust it by any corner or edge or
+drag the whole box, and nothing is committed until you say so.
+
+| key | does |
+|---|---|
+| `Enter` | save to disk **and** copy |
+| `c` | copy only, no file |
+| `e` | extract the text and copy it |
+| `t` | translate the text in it |
+| `Esc` | leave the current tool, or cancel |
+
+### Annotation
+
+| key | tool | | key | tool |
+|---|---|---|---|---|
+| `v` | select and move | | `h` | highlighter |
+| `p` | pen | | `b` | blur |
+| `a` | arrow | | `n` | step number |
+| `r` | box | | `x` | text |
+| `o` | ellipse | | | |
+
+`1`–`6` pick a colour, `w` cycles thickness, `Ctrl+Z` / `Ctrl+Shift+Z` undo and
+redo. The toolbars stick to whichever screen edges the selection leaves clear.
+
+Two that are not what they look like:
+
+- **Blur pixelates in place.** A black box drawn on top can be undone by anyone
+  holding the file; redaction that can be undone is not redaction.
+- **Step numbers count from how many are placed**, not a running total, so undo
+  hands the number back rather than leaving a gap.
+
+While typing text the keyboard belongs entirely to the text — the tools are
+single letters, so typing "copy" would otherwise pick a colour, save the shot
+and close the overlay. `Enter` keeps it, `Shift+Enter` starts a line, `Esc`
+discards it.
+
+## Configuration
 
 `~/.config/wl-translate/config.json`, written by the window whenever you change
 a language:
@@ -132,99 +177,78 @@ a language:
   "recent_source": ["it", "en", "fa"],
   "recent_target": ["fa", "en", "it"],
   "engine": "google",
-  "langs": "eng+ita+fas"
+  "langs": "fas+ita+eng",
+  "freeze": true,
+  "tessdata": "/home/you/.local/share/tessdata"
 }
 ```
 
 A missing or unparseable file just means defaults — settings should never be the
 reason a keybind stops working.
 
-### Window rule
-
-The popup has no `app_id` yet, so match it on title:
+### Hyprland
 
 ```
-windowrulev2 = float, title:^wl-translate$
-windowrulev2 = size 720 440, title:^wl-translate$
-windowrulev2 = center, title:^wl-translate$
+windowrulev2 = float, class:^(org\.wl_translate\.Gtk)$, title:^(wl-translate)$
+windowrulev2 = center, class:^(org\.wl_translate\.Gtk)$, title:^(wl-translate)$
+windowrulev2 = size 860 460, class:^(org\.wl_translate\.Gtk)$, title:^(wl-translate)$
+
+bind = SUPER CTRL, C,      exec, wl-translate selection
+bind = SUPER SHIFT, C,     exec, wl-translate ocr
+bind = , Print,            exec, wl-translate shot region
+bind = ALT, Print,         exec, wl-translate shot window
+bind = CTRL, Print,        exec, wl-translate shot screen
 ```
 
-Without this the compositor tiles it like an ordinary window.
-
-### Keybinds
-
-Hyprland:
-
-```
-bind = SUPER CTRL, T,     exec, wl-translate selection
-bind = SUPER ALT, T,      exec, wl-translate clipboard
-bind = SUPER, Print,      exec, wl-translate ocr
-bind = SUPER SHIFT, Print, exec, wl-translate ocr --raw
-```
-
-KDE, niri, sway and anything else: bind the same commands. That is the whole
-portability story.
+Both windows are one GTK application and share an `app_id`, so rules tell them
+apart by title. Do not add a rule for the overlay: it makes itself fullscreen,
+and floating it makes GTK fall back to a default size, which stops the selection
+lining up with the capture behind it.
 
 ## Backends
 
 **`google`** (default) is the undocumented endpoint the Google Translate web
-widget calls. No API key, no account, ~105ms. It is rate-limited per IP and
-outside Google's terms of service, so it suits personal use and should not be a
-product default.
+widget calls. No API key, ~105ms. Rate-limited per IP and outside Google's terms
+of service, so it suits personal use and should not be a product default.
 
-**`ai`** is any OpenAI-compatible chat endpoint. Noticeably better on Persian,
-idiom, and text with OCR errors in it, at the cost of a key and a slower round
-trip. Configured entirely by environment so no provider is baked in:
+**`ai`** is any OpenAI-compatible chat endpoint. Better on Persian, idiom, and
+text with OCR errors in it, at the cost of a key. Configured by environment so
+no provider is baked in:
 
 ```sh
 export WLT_AI_KEY=...
 export WLT_AI_MODEL=...
-export WLT_AI_URL=https://api.groq.com/openai/v1   # optional, this is the default
+export WLT_AI_URL=https://api.groq.com/openai/v1   # optional, the default
 ```
 
-## Performance
+## Notes
 
-Capture is deliberately two steps — pick the region first, then grab only that
-region as PPM. Measured on a three-monitor setup:
+Some things that cost time and are easy to trip over again:
 
-| approach | time |
-|---|---|
-| whole desktop → PNG, crop after | ~420 ms |
-| region only → PPM | ~42 ms |
-
-The rest of the budget is ~160 ms for tesseract and ~105 ms for the translation
-round trip.
+- **GTK's GSK renderer initialises Vulkan by default.** On a machine with an
+  NVIDIA GPU that pulled in the driver: 235MB resident and two dozen threads for
+  a daemon that shows nothing most of its life. The app sets
+  `GSK_RENDERER=cairo` unless you set it yourself.
+- **Tesseract is built against OpenMP** and spawns a thread per core. For one
+  screenshot-sized image that buys nothing and costs a dozen threads plus their
+  allocator arenas. Pinned to one.
+- **Dropping the OCR engine does not return memory** on its own — glibc keeps
+  freed heap in its arenas, so RSS never moves. `malloc_trim` is what hands the
+  pages back.
+- **The capture is drawn once, as a texture.** Only the dimming and annotations
+  are redrawn per frame. Drawing the capture every frame is what made an earlier
+  version stutter, and no renderer choice fixes that much work per pointer event.
 
 ## Development
 
-Worktrees share one build cache via `.cargo/config.toml`, which is machine-local
-and gitignored because it holds an absolute path. Recreate it after cloning:
+Geometry (`geom.rs`) and annotation shapes (`annotate.rs`) hold no widget types.
+That is deliberate: they survived a complete change of toolkit unchanged, tests
+and all, because the rules for what a drag means and what shape an arrow head is
+have nothing to do with which library draws them.
 
 ```sh
-mkdir -p .cargo
-cat > .cargo/config.toml <<'EOF'
-[build]
-target-dir = "/absolute/path/to/a/shared/cache"
-EOF
+cargo test
 ```
-
-Without it every `git worktree add` recompiles the full dependency tree from
-scratch, which makes worktrees slower than switching branches.
-
-## Status
-
-Working: `selection`, `clipboard`, `text`, `ocr`, `daemon` with the D-Bus verbs
-and the popup.
-
-Known gaps:
-
-- The window sets `id` but the Wayland `app_id` still comes through empty, so
-  compositor rules have to match on title.
-- No full language list — only the chips, so reaching a language you have not
-  used recently means editing the config file.
-- Overriding `--from`, `--to`, `--engine` or `--geometry` runs in the calling
-  process rather than the daemon, since the D-Bus verbs carry no arguments.
-- The `ai` backend is written but untested.
 
 ## License
 

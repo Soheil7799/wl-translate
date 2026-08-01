@@ -86,6 +86,56 @@ pub enum Corner {
     BottomRight,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// The edge under the pointer, if any.
+///
+/// Corners are checked first by the caller and win: within the grab radius of a
+/// corner, two edges are both in range, and resizing one axis when you aimed at
+/// a corner feels broken.
+pub fn nearest_edge(rect: Rect, position: Point) -> Option<Edge> {
+    let within_x = position.x >= rect.x - HANDLE_GRAB && position.x <= rect.right() + HANDLE_GRAB;
+    let within_y = position.y >= rect.y - HANDLE_GRAB && position.y <= rect.bottom() + HANDLE_GRAB;
+
+    if within_x && (position.y - rect.y).abs() <= HANDLE_GRAB {
+        return Some(Edge::Top);
+    }
+    if within_x && (position.y - rect.bottom()).abs() <= HANDLE_GRAB {
+        return Some(Edge::Bottom);
+    }
+    if within_y && (position.x - rect.x).abs() <= HANDLE_GRAB {
+        return Some(Edge::Left);
+    }
+    if within_y && (position.x - rect.right()).abs() <= HANDLE_GRAB {
+        return Some(Edge::Right);
+    }
+
+    None
+}
+
+/// The rectangle you get by dragging one edge to `position`.
+pub fn resize_edge(rect: Rect, edge: Edge, position: Point) -> Rect {
+    let (mut left, mut top, mut right, mut bottom) =
+        (rect.x, rect.y, rect.right(), rect.bottom());
+
+    match edge {
+        Edge::Top => top = position.y,
+        Edge::Bottom => bottom = position.y,
+        Edge::Left => left = position.x,
+        Edge::Right => right = position.x,
+    }
+
+    // Through from_corners so dragging an edge past its opposite flips rather
+    // than producing a negative size.
+    from_corners(Point::new(left, top), Point::new(right, bottom))
+}
+
 /// A rectangle from two opposite corners, in any order.
 pub fn from_corners(a: Point, b: Point) -> Rect {
     Rect::new(
@@ -333,6 +383,43 @@ mod tests {
             sidebar_anchor(at(1600.0, 0.0, 320.0, 1080.0), SCREEN, 190.0),
             Side::Left
         );
+    }
+
+    #[test]
+    fn each_edge_is_grabbable_and_the_middle_is_not() {
+        let rect = Rect::new(Point::new(100.0, 100.0), Size::new(200.0, 200.0));
+
+        assert_eq!(nearest_edge(rect, Point::new(200.0, 102.0)), Some(Edge::Top));
+        assert_eq!(
+            nearest_edge(rect, Point::new(200.0, 298.0)),
+            Some(Edge::Bottom)
+        );
+        assert_eq!(nearest_edge(rect, Point::new(102.0, 200.0)), Some(Edge::Left));
+        assert_eq!(
+            nearest_edge(rect, Point::new(298.0, 200.0)),
+            Some(Edge::Right)
+        );
+        assert_eq!(nearest_edge(rect, Point::new(200.0, 200.0)), None);
+    }
+
+    #[test]
+    fn dragging_an_edge_moves_only_that_side() {
+        let rect = Rect::new(Point::new(100.0, 100.0), Size::new(200.0, 200.0));
+        let widened = resize_edge(rect, Edge::Right, Point::new(400.0, 999.0));
+
+        assert_eq!(widened.x, 100.0);
+        assert_eq!(widened.y, 100.0);
+        assert_eq!(widened.height, 200.0, "the other axis must not move");
+        assert_eq!(widened.width, 300.0);
+    }
+
+    #[test]
+    fn dragging_an_edge_past_its_opposite_flips_instead_of_going_negative() {
+        let rect = Rect::new(Point::new(100.0, 100.0), Size::new(200.0, 200.0));
+        let flipped = resize_edge(rect, Edge::Left, Point::new(400.0, 0.0));
+
+        assert_eq!(flipped.x, 300.0);
+        assert_eq!(flipped.width, 100.0);
     }
 
     #[test]
