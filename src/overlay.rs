@@ -26,6 +26,11 @@ use crate::annotate::{self, Annotation, Tool};
 use crate::geom::{self, Point, Rect, Size};
 use crate::shot;
 
+/// Height of the action bar and width of the tool strip, as the anchor rules
+/// see them. Only used to decide which edge is free, so approximate is fine.
+const ACTION_BAR: f64 = 84.0;
+const TOOL_STRIP: f64 = 130.0;
+
 /// Everything the overlay is holding while it is open.
 struct State {
     capture: shot::Capture,
@@ -143,8 +148,12 @@ pub fn present(
 
     window.set_child(Some(&overlay));
 
-    wire_pointer(&canvas, &state);
+    wire_pointer(&canvas, &state, &tools, &actions);
     wire_keys(&window, &state, &canvas, &finished);
+
+    // Window and screen presets arrive with a selection already made, so the
+    // bars have to move before anything is dragged.
+    reposition(&state.borrow(), &tools, &actions);
 
     window.present();
 }
@@ -218,9 +227,47 @@ fn draw(state: &State, cr: &gtk::cairo::Context, width: f64, height: f64) {
     }
 }
 
+/// Put the toolbars on whichever screen edges the selection leaves clear.
+///
+/// They stick to the screen rather than following the selection around - all
+/// they do is get out of its way. Without this they sat where they were built
+/// and a selection near an edge simply covered them.
+fn reposition(state: &State, tools: &gtk::Widget, actions: &gtk::Widget) {
+    match geom::toolbar_anchor(state.selection, state.screen, ACTION_BAR) {
+        geom::Anchor::Top => {
+            actions.set_valign(gtk::Align::Start);
+            actions.set_margin_top(24);
+            actions.set_margin_bottom(0);
+        }
+        geom::Anchor::Bottom => {
+            actions.set_valign(gtk::Align::End);
+            actions.set_margin_top(0);
+            actions.set_margin_bottom(24);
+        }
+    }
+
+    match geom::sidebar_anchor(state.selection, state.screen, TOOL_STRIP) {
+        geom::Side::Left => {
+            tools.set_halign(gtk::Align::Start);
+            tools.set_margin_start(16);
+            tools.set_margin_end(0);
+        }
+        geom::Side::Right => {
+            tools.set_halign(gtk::Align::End);
+            tools.set_margin_start(0);
+            tools.set_margin_end(16);
+        }
+    }
+}
+
 // ── input ──────────────────────────────────────────────────────────────────
 
-fn wire_pointer(canvas: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
+fn wire_pointer(
+    canvas: &gtk::DrawingArea,
+    state: &Rc<RefCell<State>>,
+    tools: &gtk::Widget,
+    actions: &gtk::Widget,
+) {
     let drag = gtk::GestureDrag::new();
 
     {
@@ -257,6 +304,8 @@ fn wire_pointer(canvas: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
     {
         let state = state.clone();
         let canvas = canvas.clone();
+        let tools = tools.clone();
+        let actions = actions.clone();
 
         drag.connect_drag_update(move |gesture, dx, dy| {
             let Some((start_x, start_y)) = gesture.start_point() else {
@@ -291,6 +340,7 @@ fn wire_pointer(canvas: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
                 None => {}
             }
 
+            reposition(&state, &tools, &actions);
             canvas.queue_draw();
         });
     }
@@ -690,9 +740,9 @@ fn tool_column(state: &Rc<RefCell<State>>, canvas: &gtk::DrawingArea) -> gtk::Wi
     let strip = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     strip.append(&tools);
     strip.append(&colors);
-    strip.set_halign(gtk::Align::Start);
+    // Horizontal placement is decided by `reposition`; only the vertical
+    // centring is fixed.
     strip.set_valign(gtk::Align::Center);
-    strip.set_margin_start(16);
 
     // `osd` and `toolbar` are GTK's own style classes, so the strip picks up
     // whatever the system theme says an overlay toolbar looks like - including
@@ -755,9 +805,8 @@ fn action_bar(
         bar.append(&button);
     }
 
+    // Vertical placement is decided by `reposition`.
     bar.set_halign(gtk::Align::Center);
-    bar.set_valign(gtk::Align::End);
-    bar.set_margin_bottom(24);
     bar.add_css_class("osd");
     bar.add_css_class("toolbar");
 
