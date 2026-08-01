@@ -43,6 +43,11 @@ struct State {
     undone: Vec<Annotation>,
     ink: [f64; 4],
     width: f64,
+    /// True while a text annotation is being typed into. Every key belongs to
+    /// the text while this is set, which is the whole reason it exists: the
+    /// tools and commit actions are single letters, so typing "copy" would
+    /// otherwise pick a colour, save the shot and close the overlay.
+    typing: bool,
     /// Kept so the active indicator can be moved without rebuilding the strip.
     tool_buttons: Vec<(Option<Tool>, gtk::Button)>,
     swatches: Vec<gtk::DrawingArea>,
@@ -99,6 +104,7 @@ pub fn present(
         undone: Vec::new(),
         ink: annotate::PALETTE[0].1,
         width: annotate::WIDTHS[1],
+        typing: false,
         tool_buttons: Vec::new(),
         swatches: Vec::new(),
     }));
@@ -199,6 +205,11 @@ fn draw(state: &State, cr: &gtk::cairo::Context, width: f64, height: f64) {
         // Blur edits pixels rather than drawing, so the preview stands in for
         // it with a filled box; pixelating per pointer move would cost far more
         // than it tells you.
+        if annotation.tool == Tool::Counter || annotation.tool == Tool::Text {
+            annotate::draw_special(cr, annotation);
+            continue;
+        }
+
         if annotation.tool == Tool::Blur {
             if let Some(area) = annotation.bounds() {
                 cr.set_source_rgba(0.08, 0.08, 0.10, 0.85);
@@ -280,7 +291,22 @@ fn wire_pointer(
 
             if let Some(tool) = state.tool {
                 let (ink, width) = tool.ink(state.ink, state.width);
-                state.drawing = Some(Annotation::new(tool, at, ink, width));
+                let mut annotation = Annotation::new(tool, at, ink, width);
+
+                // Numbered from how many counters are already placed, rather
+                // than a running total: undo then hands the number back instead
+                // of leaving a gap in the sequence.
+                if tool == Tool::Counter {
+                    annotation.index = state
+                        .annotations
+                        .iter()
+                        .filter(|a| a.tool == Tool::Counter)
+                        .count() as u32
+                        + 1;
+                }
+
+                state.typing = tool == Tool::Text;
+                state.drawing = Some(annotation);
                 state.drag = Some(Drag::Draw);
             } else {
                 state.drag = Some(match state.selection {
@@ -351,6 +377,14 @@ fn wire_pointer(
 
         drag.connect_drag_end(move |_gesture, _dx, _dy| {
             let mut state = state.borrow_mut();
+
+            // Text is still being typed at this point, so releasing the button
+            // must leave it alone. It is committed by Enter or Escape.
+            if state.typing {
+                state.drag = None;
+                canvas.queue_draw();
+                return;
+            }
 
             // A click that drew nothing is dropped, rather than left as an
             // invisible entry that Undo would appear to ignore.
@@ -425,6 +459,53 @@ fn wire_keys(
         let control = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
         let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
 
+        // While typing, the keyboard belongs to the text and nothing else.
+        if state.borrow().typing {
+            let mut state = state.borrow_mut();
+
+            match key {
+                // Enter keeps it, Escape throws it away. Shift+Enter is a
+                // newline, so a caption can be more than one line.
+                gdk::Key::Return | gdk::Key::KP_Enter if !shift => {
+                    state.typing = false;
+
+                    if let Some(drawing) = state.drawing.take() {
+                        if drawing.is_usable() {
+                            state.annotations.push(drawing);
+                            state.undone.clear();
+                        }
+                    }
+                }
+                gdk::Key::Escape => {
+                    state.typing = false;
+                    state.drawing = None;
+                }
+                gdk::Key::Return | gdk::Key::KP_Enter => {
+                    if let Some(drawing) = &mut state.drawing {
+                        drawing.text.push('\n');
+                    }
+                }
+                gdk::Key::BackSpace => {
+                    if let Some(drawing) = &mut state.drawing {
+                        drawing.text.pop();
+                    }
+                }
+                _ => {
+                    if let Some(character) = key.to_unicode() {
+                        if !character.is_control() {
+                            if let Some(drawing) = &mut state.drawing {
+                                drawing.text.push(character);
+                            }
+                        }
+                    }
+                }
+            }
+
+            drop(state);
+            canvas.queue_draw();
+            return glib::Propagation::Stop;
+        }
+
         let commit = |what: Commit| {
             let done = commit(&state.borrow(), what);
             owner.close();
@@ -471,6 +552,8 @@ fn wire_keys(
             gdk::Key::o => set_tool(&state, &canvas, Some(Tool::Ellipse)),
             gdk::Key::h => set_tool(&state, &canvas, Some(Tool::Highlight)),
             gdk::Key::b => set_tool(&state, &canvas, Some(Tool::Blur)),
+            gdk::Key::n => set_tool(&state, &canvas, Some(Tool::Counter)),
+            gdk::Key::x => set_tool(&state, &canvas, Some(Tool::Text)),
             gdk::Key::w => {
                 let mut state = state.borrow_mut();
                 let next = annotate::WIDTHS
@@ -632,6 +715,16 @@ fn tool_column(state: &Rc<RefCell<State>>, canvas: &gtk::DrawingArea) -> gtk::Wi
             Tool::Highlight.label(),
         ),
         (Some(Tool::Blur), "view-conceal-symbolic", Tool::Blur.label()),
+        (
+            Some(Tool::Counter),
+            "list-add-symbolic",
+            Tool::Counter.label(),
+        ),
+        (
+            Some(Tool::Text),
+            "insert-text-symbolic",
+            Tool::Text.label(),
+        ),
     ] {
         let button = gtk::Button::from_icon_name(icon);
         button.set_tooltip_text(Some(tip));

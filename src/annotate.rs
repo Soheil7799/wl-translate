@@ -1,10 +1,10 @@
 //! Annotations drawn on top of a capture.
 //!
-//! Two things render these: the live preview on the overlay canvas, and the
-//! rasteriser that bakes them into the saved PNG. Rather than writing the
-//! shapes twice and watching the two drift apart, both draw from [`outline`],
-//! which reduces every tool to a list of polylines. The preview strokes them
-//! Cairo draws both, so a preview cannot disagree with what gets saved.
+//! Two things render these: the live preview on the overlay, and the pass that
+//! bakes them into the saved PNG. Both are Cairo, and both go through the same
+//! descriptions here - [`outline`] for everything that is a polyline, and
+//! [`draw_special`] for the ones that are not - so a preview cannot disagree
+//! with what ends up in the file.
 
 use crate::geom::{Point, Rect, Size};
 
@@ -31,6 +31,12 @@ pub enum Tool {
     /// drawing over them, because a drawn-on black box can be undone by anyone
     /// with the file, and redaction that can be undone is not redaction.
     Blur,
+    /// A numbered disc, placed with a click and counting up as you go. For
+    /// walking someone through a screenshot in order.
+    Counter,
+    /// Typed text, placed with a click. Pango is behind Cairo's text, so this
+    /// gets Persian and other right-to-left scripts shaped correctly for free.
+    Text,
 }
 
 impl Tool {
@@ -42,6 +48,8 @@ impl Tool {
             Tool::Ellipse => "Ellipse  (o)",
             Tool::Highlight => "Highlight  (h)",
             Tool::Blur => "Blur  (b)",
+            Tool::Counter => "Step number  (n)",
+            Tool::Text => "Text  (x)",
         }
     }
 
@@ -62,13 +70,20 @@ impl Tool {
     /// thrown away on mouse-up - the tool drew a live preview and then silently
     /// kept nothing.
     fn needs_a_drag(self) -> bool {
-        !matches!(self, Tool::Pen | Tool::Highlight)
+        !matches!(
+            self,
+            Tool::Pen | Tool::Highlight | Tool::Counter | Tool::Text
+        )
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Annotation {
     pub tool: Tool,
+    /// Which step this is, for [`Tool::Counter`]. Ignored by every other tool.
+    pub index: u32,
+    /// What was typed, for [`Tool::Text`].
+    pub text: String,
     /// Pen keeps every sample; the other tools keep only start and end.
     pub points: Vec<Point>,
     /// Straight rgba, 0..1, so both renderers can take it unchanged.
@@ -80,6 +95,8 @@ impl Annotation {
     pub fn new(tool: Tool, from: Point, color: [f64; 4], width: f64) -> Self {
         Self {
             tool,
+            index: 0,
+            text: String::new(),
             points: vec![from],
             color,
             width,
@@ -92,6 +109,8 @@ impl Annotation {
     /// keeps replacing the second one as you drag.
     pub fn extend(&mut self, to: Point) {
         match self.tool {
+            // These sit where they were put; dragging must not smear them.
+            Tool::Counter | Tool::Text => {}
             Tool::Pen | Tool::Highlight => self.points.push(to),
             _ => {
                 self.points.truncate(1);
@@ -102,6 +121,14 @@ impl Annotation {
 
     /// Whether this is worth keeping, or just a click that drew nothing.
     pub fn is_usable(&self) -> bool {
+        if self.tool == Tool::Text {
+            return !self.text.trim().is_empty();
+        }
+
+        if self.tool == Tool::Counter {
+            return !self.points.is_empty();
+        }
+
         if self.tool.needs_a_drag() {
             self.points.len() == 2 && distance(self.points[0], self.points[1]) > 3.0
         } else {
@@ -125,8 +152,9 @@ impl Annotation {
 /// Every polyline making up an annotation, in the same space its points are in.
 pub fn outline(annotation: &Annotation) -> Vec<Vec<Point>> {
     match annotation.tool {
-        // Blur has no outline: it replaces pixels rather than drawing on them.
-        Tool::Blur => Vec::new(),
+        // None of these is a polyline: blur replaces pixels, a counter is a
+        // disc with a number in it, and text is text. All go to `draw_special`.
+        Tool::Blur | Tool::Counter | Tool::Text => Vec::new(),
 
         Tool::Pen | Tool::Highlight => vec![annotation.points.clone()],
 
@@ -155,6 +183,75 @@ pub fn outline(annotation: &Annotation) -> Vec<Vec<Point>> {
             [a, b] => vec![ellipse(*a, *b)],
             _ => Vec::new(),
         },
+    }
+}
+
+/// Font size for a given stroke width, so the thickness control sizes text too.
+pub fn text_size(width: f64) -> f64 {
+    width * 5.0 + 6.0
+}
+
+/// Radius of a counter disc for a given stroke width.
+pub fn counter_radius(width: f64) -> f64 {
+    width * 2.0 + 9.0
+}
+
+/// Draw the tools that are not polylines, in whatever user space `cr` is in.
+///
+/// Shared by the live overlay and the saved PNG. Both are Cairo now, so the
+/// number on screen is drawn by the same code that draws the number in the
+/// file - there is no second implementation to disagree with the first.
+pub fn draw_special(cr: &cairo::Context, annotation: &Annotation) {
+    let Some(at) = annotation.points.first() else {
+        return;
+    };
+
+    let [red, green, blue, alpha] = annotation.color;
+
+    if annotation.tool == Tool::Text {
+        cr.set_source_rgba(red, green, blue, alpha);
+        cr.select_font_face("sans-serif", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+        cr.set_font_size(text_size(annotation.width));
+
+        // Baseline per line, so a multi-line caption stacks properly.
+        for (row, line) in annotation.text.split('\n').enumerate() {
+            let step = text_size(annotation.width) * 1.25;
+            cr.move_to(at.x, at.y + step * (row as f64 + 1.0));
+            let _ = cr.show_text(line);
+        }
+
+        return;
+    }
+
+    if annotation.tool != Tool::Counter {
+        return;
+    }
+
+    let radius = counter_radius(annotation.width);
+
+    cr.set_source_rgba(red, green, blue, alpha);
+    cr.arc(at.x, at.y, radius, 0.0, std::f64::consts::TAU);
+    let _ = cr.fill();
+
+    // White on the palette colours, all of which are mid-to-dark except the
+    // white swatch - which gets black so the number does not vanish.
+    let bright = red + green + blue > 2.4;
+    if bright {
+        cr.set_source_rgb(0.0, 0.0, 0.0);
+    } else {
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+    }
+
+    let label = annotation.index.to_string();
+    cr.select_font_face("sans-serif", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+    cr.set_font_size(radius * 1.25);
+
+    if let Ok(extents) = cr.text_extents(&label) {
+        cr.move_to(
+            at.x - extents.width() / 2.0 - extents.x_bearing(),
+            at.y - extents.height() / 2.0 - extents.y_bearing(),
+        );
+        let _ = cr.show_text(&label);
     }
 }
 
@@ -268,7 +365,25 @@ pub fn rasterize(
     cr.set_line_cap(LineCap::Round);
     cr.set_line_join(LineJoin::Round);
 
-    for annotation in annotations.iter().filter(|a| a.tool != Tool::Blur) {
+    // Counters are drawn in the same user space as everything else, so shift
+    // and scale once and reuse the preview's own routine.
+    cr.save()?;
+    cr.scale(scale, scale);
+    cr.translate(-origin.x, -origin.y);
+
+    for annotation in annotations
+        .iter()
+        .filter(|a| a.tool == Tool::Counter || a.tool == Tool::Text)
+    {
+        draw_special(&cr, annotation);
+    }
+
+    cr.restore()?;
+
+    for annotation in annotations
+        .iter()
+        .filter(|a| !matches!(a.tool, Tool::Blur | Tool::Counter | Tool::Text))
+    {
         let [red, green, blue, alpha] = annotation.color;
         cr.set_source_rgba(red, green, blue, alpha);
         cr.set_line_width((annotation.width * scale).max(1.0));
