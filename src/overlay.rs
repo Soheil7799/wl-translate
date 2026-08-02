@@ -156,6 +156,17 @@ pub fn present(
 
     window.set_child(Some(&overlay));
 
+    {
+        // Covers the paths that do not go through a button or a key - the
+        // compositor closing it, or the session ending.
+        let state = state.clone();
+
+        window.connect_close_request(move |_window| {
+            teardown(&state);
+            glib::Propagation::Proceed
+        });
+    }
+
     wire_pointer(&canvas, &state, &tools, &actions);
     wire_keys(&window, &state, &canvas, &finished);
 
@@ -164,6 +175,27 @@ pub fn present(
     reposition(&state.borrow(), &tools, &actions);
 
     window.present();
+}
+
+/// Break the overlay's reference cycle and release the capture.
+///
+/// `State` holds the tool buttons and swatches so their active markers can be
+/// updated, and every one of those widgets owns a closure holding an `Rc` back
+/// to `State`. That is a cycle: neither side ever reaches zero, so the state -
+/// and with it a full-screen PNG and its GPU texture - was leaked on every
+/// capture. Roughly thirty megabytes each time, never returned.
+///
+/// Clearing the widget lists is what breaks it. The rest is just letting go of
+/// the pixels early rather than waiting for the drop.
+fn teardown(state: &Rc<RefCell<State>>) {
+    let mut state = state.borrow_mut();
+
+    state.tool_buttons.clear();
+    state.swatches.clear();
+    state.annotations.clear();
+    state.undone.clear();
+    state.drawing = None;
+    state.capture.png = Vec::new();
 }
 
 // ── drawing ────────────────────────────────────────────────────────────────
@@ -466,9 +498,10 @@ fn wire_keys(
     let state = state.clone();
     let canvas = canvas.clone();
     let finished = finished.clone();
-    // Cloned for the closure; the original is still needed below to attach the
-    // controller to.
-    let owner = window.clone();
+    // WEAK, not a clone. This controller is owned by the window, so a strong
+    // reference here is a cycle: the window is never destroyed, and it still
+    // holds the capture's full-screen texture.
+    let owner = window.downgrade();
 
     keys.connect_key_pressed(move |_controller, key, _code, modifiers| {
         let control = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
@@ -523,7 +556,12 @@ fn wire_keys(
 
         let commit = |what: Commit| {
             let done = commit(&state.borrow(), what);
-            owner.close();
+            teardown(&state);
+
+            if let Some(window) = owner.upgrade() {
+                window.destroy();
+            }
+
             finished(done);
         };
 
@@ -537,7 +575,12 @@ fn wire_keys(
                 if holding {
                     set_tool(&state, &canvas, None);
                 } else {
-                    owner.close();
+                    teardown(&state);
+
+                    if let Some(window) = owner.upgrade() {
+                        window.destroy();
+                    }
+
                     finished(Done::Cancelled);
                 }
             }
@@ -897,7 +940,8 @@ fn action_bar(
         button.add_css_class("flat");
 
         let state = state.clone();
-        let window = window.clone();
+        // Weak for the same reason: this button lives inside the window.
+        let window = window.downgrade();
         let finished = finished.clone();
 
         button.connect_clicked(move |_| {
@@ -906,7 +950,12 @@ fn action_bar(
                 None => Done::Cancelled,
             };
 
-            window.close();
+            teardown(&state);
+
+            if let Some(window) = window.upgrade() {
+                window.destroy();
+            }
+
             finished(done);
         });
 
